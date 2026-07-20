@@ -644,8 +644,7 @@ configure_ssh() {
     die 'reload ssh.service 失败，已尝试恢复旧配置。'
   fi
 
-  local attempt
-  for attempt in {1..10}; do
+  for _ in {1..10}; do
     is_tcp_port_listening "$SSH_PORT" && break
     sleep 1
   done
