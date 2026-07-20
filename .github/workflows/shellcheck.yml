@@ -36,6 +36,14 @@ jobs:
           grep -Fqx 'speed-check-mode tcp:443,ping' 404notfound.sh
           grep -Fqx 'response-mode first-ping' 404notfound.sh
 
+      - name: Check installer regressions
+        run: |
+          ! grep -Fq 'Include /etc/ssh/sshd_config.d/00-hardening.conf' 404notfound.sh
+          grep -Fq 'smartdns -v' 404notfound.sh
+          ! grep -Fq 'smartdns -V' 404notfound.sh
+          ! grep -Fq 'smartdns --version' 404notfound.sh
+          grep -Fq 'sort -nu' 404notfound.sh
+
       - name: Install ShellCheck
         run: |
           sudo apt-get update

@@ -43,7 +43,13 @@ SSHD_EFFECTIVE_ROOT=''
 SSH_READY=false
 SMARTDNS_READY=false
 DNS_READY=false
+SYSTEM_UPDATE_READY=false
+BASE_TOOLS_READY=false
 REALITY_CHECKER_STATE='安装失败'
+SSH_ROLLBACK_STATE='未触发'
+FAILURE_STEP=''
+FAILURE_REASON=''
+RESULT_REPORTED=false
 LAST_WRITE_CHANGED=false
 COLOR_ENABLED=false
 HEALTH_BLOCKERS=0
@@ -101,6 +107,8 @@ warn() {
 }
 
 die() {
+  FAILURE_STEP=$CURRENT_STEP
+  FAILURE_REASON=$*
   printf '[%s] [ERROR] 步骤“%s”失败：%s\n' "$(timestamp)" "$CURRENT_STEP" "$*" >&2
   exit 1
 }
@@ -109,25 +117,40 @@ on_error() {
   local exit_code=$?
   local line_number=$1
   trap - ERR
+  FAILURE_STEP=$CURRENT_STEP
+  FAILURE_REASON="第 $line_number 行发生未处理错误（退出码 $exit_code）"
   printf '[%s] [ERROR] 步骤“%s”在第 %s 行失败（退出码 %s）。\n' \
     "$(timestamp)" "$CURRENT_STEP" "$line_number" "$exit_code" >&2
   exit "$exit_code"
 }
 
+on_signal() {
+  FAILURE_STEP=$CURRENT_STEP
+  FAILURE_REASON='收到中断信号'
+  warn '收到中断信号，停止执行。'
+  exit 130
+}
+
 cleanup() {
   local exit_code=$?
+  set +e
+  if (( exit_code != 0 )) && [[ "$RESULT_REPORTED" == false ]]; then
+    print_failure_report >&2
+  fi
   if [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]]; then
     rm -rf -- "$TMP_DIR"
   fi
+  trap - EXIT
   exit "$exit_code"
 }
 
 trap 'on_error $LINENO' ERR
 trap cleanup EXIT
-trap 'warn "收到中断信号，停止执行。"; exit 130' INT TERM
+trap on_signal INT TERM
 
 initialize_colors() {
-  if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  COLOR_ENABLED=false
+  if [[ -t 1 && -t 2 && -z "${NO_COLOR+x}" ]]; then
     COLOR_ENABLED=true
   fi
 }
@@ -168,6 +191,31 @@ health_status_text() {
 health_box_line() {
   color_text '38;5;208' '############################################################'
   printf '\n'
+}
+
+result_box_line() {
+  health_box_line
+}
+
+result_status_text() {
+  health_status_text "$1"
+}
+
+result_safe_text() {
+  local text=$1
+  text=${text//$'\033'/}
+  text=${text//$'\r'/ }
+  text=${text//$'\n'/ }
+  printf '%s' "$text"
+}
+
+result_row() {
+  local status=$1
+  local label=$2
+  local detail
+  detail=$(result_safe_text "$3")
+  result_status_text "$status"
+  printf ' %-18s %s\n' "$label" "$detail"
 }
 
 read_tty() {
@@ -823,6 +871,7 @@ update_system() {
     log '执行非交互式 full-upgrade；不会自动重启。'
     apt_get full-upgrade -y
   fi
+  SYSTEM_UPDATE_READY=true
 }
 
 install_base_packages() {
@@ -840,6 +889,7 @@ install_base_packages() {
     command -v "$command_name" >/dev/null 2>&1 ||
       die "安装后仍找不到关键命令：$command_name。"
   done
+  BASE_TOOLS_READY=true
   log '基础软件包及关键命令验证通过。'
 }
 
@@ -1010,37 +1060,83 @@ neutralize_ssh_conflicts() {
   fi
 }
 
-ensure_bootstrap_include_first() {
-  local cleaned_file
+ensure_standard_ssh_dropin_include() {
   local staged_file
+  local wildcard_path="$SSH_DROPIN_DIR/*.conf"
   [[ -f "$SSH_MAIN_CONFIG" && ! -L "$SSH_MAIN_CONFIG" ]] ||
     die "$SSH_MAIN_CONFIG 必须是普通文件。"
 
-  cleaned_file=$(mktemp "$TMP_DIR/sshd-main-clean.XXXXXXXX")
   staged_file=$(mktemp "$TMP_DIR/sshd-main-stage.XXXXXXXX")
-  awk '
+  awk -v wildcard_path="$wildcard_path" -v managed_path="$SSH_DROPIN" '
+    BEGIN {
+      global_scope = 1
+    }
+    function keep(line) {
+      lines[++line_count] = line
+    }
     $0 == "# BEGIN 404NOTFOUND BOOTSTRAP INCLUDE" { skipping = 1; next }
     $0 == "# END 404NOTFOUND BOOTSTRAP INCLUDE" {
       skipping = 0
-      after_managed_block = 1
       next
     }
     skipping { next }
-    after_managed_block && $0 == "" { next }
     {
-      after_managed_block = 0
-      print
+      trimmed = $0
+      sub(/^[[:space:]]+/, "", trimmed)
+      body = trimmed
+      sub(/[[:space:]]+#.*$/, "", body)
+      field_count = split(body, fields, /[[:space:]]+/)
+      keyword = tolower(fields[1])
+      if (keyword == "match") {
+        global_scope = 0
+      }
+      if (keyword == "include") {
+        target_found = 0
+        keep_wildcard = 0
+        other_count = 0
+        for (other_index in other_fields) {
+          delete other_fields[other_index]
+        }
+        for (field = 2; field <= field_count; field++) {
+          if (fields[field] == managed_path) {
+            target_found = 1
+            continue
+          }
+          if (fields[field] == wildcard_path) {
+            target_found = 1
+            if (global_scope && !wildcard_seen) {
+              keep_wildcard = 1
+            }
+            continue
+          }
+          other_fields[++other_count] = fields[field]
+        }
+        if (target_found) {
+          if (keep_wildcard) {
+            keep("Include " wildcard_path)
+            wildcard_seen = 1
+          }
+          if (other_count > 0) {
+            rebuilt = "Include"
+            for (field = 1; field <= other_count; field++) {
+              rebuilt = rebuilt " " other_fields[field]
+            }
+            keep(rebuilt)
+          }
+          next
+        }
+      }
+      keep($0)
     }
-  ' "$SSH_MAIN_CONFIG" >"$cleaned_file"
-
-  {
-    printf '%s\n' \
-      '# BEGIN 404NOTFOUND BOOTSTRAP INCLUDE' \
-      'Include /etc/ssh/sshd_config.d/00-hardening.conf' \
-      '# END 404NOTFOUND BOOTSTRAP INCLUDE' \
-      ''
-    cat "$cleaned_file"
-  } >"$staged_file"
+    END {
+      if (!wildcard_seen) {
+        print "Include " wildcard_path
+      }
+      for (line = 1; line <= line_count; line++) {
+        print lines[line]
+      }
+    }
+  ' "$SSH_MAIN_CONFIG" >"$staged_file"
 
   if ! cmp -s -- "$SSH_MAIN_CONFIG" "$staged_file"; then
     backup_file "$SSH_MAIN_CONFIG"
@@ -1084,7 +1180,7 @@ prepare_ssh_configuration() {
   local -a dropin_files=()
   mkdir -p "$SSH_DROPIN_DIR"
   write_ssh_dropin
-  ensure_bootstrap_include_first
+  ensure_standard_ssh_dropin_include
   if [[ -e "$LEGACY_SSH_DROPIN" || -L "$LEGACY_SSH_DROPIN" ]]; then
     backup_file "$LEGACY_SSH_DROPIN"
     rm -f -- "$LEGACY_SSH_DROPIN"
@@ -1114,18 +1210,22 @@ validate_effective_sshd_config() {
   local port_count=0
   local found_new_port=false
   local found_port_22=false
-  SSHD_EFFECTIVE=$(sshd -T)
-  SSHD_EFFECTIVE_ROOT=$(sshd -T -C user=root,host=localhost,addr=127.0.0.1)
+  SSHD_EFFECTIVE=''
+  SSHD_EFFECTIVE_ROOT=''
+  SSHD_EFFECTIVE=$(sshd -T 2>/dev/null) || return 1
+  SSHD_EFFECTIVE_ROOT=$(sshd -T -C user=root,host=localhost,addr=127.0.0.1 2>/dev/null) ||
+    return 1
 
   while IFS= read -r port; do
     [[ -n "$port" ]] || continue
+    [[ "$port" =~ ^[0-9]+$ ]] || return 1
     ((port_count += 1))
     case "$port" in
       "$SSH_PORT") found_new_port=true ;;
       22) found_port_22=true ;;
       *) return 1 ;;
     esac
-  done < <(awk '$1 == "port" { print $2 }' <<<"$SSHD_EFFECTIVE")
+  done < <(awk '$1 == "port" { print $2 }' <<<"$SSHD_EFFECTIVE" | sort -nu)
   [[ "$found_new_port" == true ]] || return 1
   if [[ "$KEEP_SSH_22" == true ]]; then
     [[ "$found_port_22" == true ]] || return 1
@@ -1150,16 +1250,65 @@ validate_effective_sshd_config() {
   sshd_value_is "$SSHD_EFFECTIVE_ROOT" x11forwarding no || return 1
 }
 
+print_effective_sshd_diagnostics() {
+  local key
+  local config
+  local value
+  warn 'sshd -T 策略验证失败；回滚前记录以下实际有效值：'
+  for key in \
+    port \
+    permitrootlogin \
+    allowusers \
+    pubkeyauthentication \
+    authenticationmethods \
+    passwordauthentication \
+    kbdinteractiveauthentication \
+    permitemptypasswords \
+    usepam \
+    x11forwarding; do
+    config=$SSHD_EFFECTIVE_ROOT
+    if [[ "$key" == 'port' ]]; then
+      config=$SSHD_EFFECTIVE
+      value=$(
+        awk '$1 == "port" { print $2 }' <<<"$config" |
+          sort -nu |
+          awk 'BEGIN { separator = "" }
+            { output = output separator $0; separator = "," }
+            END { print output }'
+      )
+    else
+      value=$(
+        awk -v key="$key" '
+          $1 == key {
+            $1 = ""
+            sub(/^[[:space:]]+/, "")
+            if (!seen[$0]++) {
+              output = output separator $0
+              separator = ","
+            }
+          }
+          END { print output }
+        ' <<<"$config"
+      )
+    fi
+    printf '[WARN] sshd -T %-30s %s\n' "$key" "${value:-<missing>}" >&2
+  done
+}
+
 rollback_ssh_configuration() {
   local index
+  local restore_failed=false
+  SSH_ROLLBACK_STATE='回滚处理中'
   warn '正在恢复本轮修改过的 SSH 配置文件；当前 SSH 会话不会被主动断开。'
   set +e
   for (( index=${#SSH_CHANGED_FILES[@]} - 1; index >= 0; index-- )); do
-    restore_file "${SSH_CHANGED_FILES[$index]}"
+    restore_file "${SSH_CHANGED_FILES[$index]}" || restore_failed=true
   done
-  if sshd -t >/dev/null 2>&1 && systemctl is-active --quiet ssh.service; then
-    systemctl reload ssh.service
+  if [[ "$restore_failed" == false ]] && sshd -t >/dev/null 2>&1 &&
+    systemctl is-active --quiet ssh.service && systemctl reload ssh.service; then
+    SSH_ROLLBACK_STATE='已回滚'
   else
+    SSH_ROLLBACK_STATE='已尝试回滚，但未完全确认'
     warn '旧 SSH 配置未能自动 reload；当前已有 sshd 进程和会话保持不动。'
   fi
   set -e
@@ -1218,6 +1367,7 @@ configure_ssh() {
     die 'sshd -t 失败，已尝试恢复本轮 SSH 配置。'
   fi
   if ! validate_effective_sshd_config; then
+    print_effective_sshd_diagnostics
     rollback_ssh_configuration
     die 'sshd -T 的最终端口或认证策略不符合目标，已尝试恢复。'
   fi
@@ -1249,6 +1399,7 @@ configure_ssh() {
     die '22/tcp 仍在监听；未启用或收紧 UFW。'
   fi
   if ! validate_effective_sshd_config; then
+    print_effective_sshd_diagnostics
     rollback_ssh_configuration
     die 'reload 后 sshd 最终策略验证失败；未启用或收紧 UFW。'
   fi
@@ -1770,18 +1921,21 @@ install_sing_box() {
 
 smartdns_version_text() {
   local output
-  output=$(smartdns -V 2>&1 || true)
-  if [[ -z "$output" ]]; then
-    output=$(smartdns --version 2>&1 || true)
+  if ! output=$(smartdns -v 2>&1); then
+    return 1
   fi
-  printf '%s' "${output%%$'\n'*}"
+  grep -qi 'invalid option' <<<"$output" && return 1
+  output=$(awk 'NF { print; exit }' <<<"$output")
+  [[ -n "$output" ]] || return 1
+  printf '%s' "$output"
 }
 
 install_smartdns() {
   CURRENT_STEP='安装并配置 SmartDNS'
+  local smartdns_version
   apt_get install -y smartdns
   command -v smartdns >/dev/null 2>&1 || die '安装后找不到 smartdns。'
-  [[ -n "$(smartdns_version_text)" ]] || die 'SmartDNS 版本验证失败。'
+  smartdns_version=$(smartdns_version_text) || die 'SmartDNS 版本验证失败。'
 
   local staged_config
   staged_config=$(mktemp "$TMP_DIR/smartdns.conf.XXXXXXXX")
@@ -1856,7 +2010,7 @@ SMARTDNS_CONFIG
     die 'SmartDNS 本地解析验证失败，系统 DNS 尚未修改。'
 
   SMARTDNS_READY=true
-  log "SmartDNS 已安装并验证：$(smartdns_version_text)，127.0.0.1:53/udp+tcp。"
+  log "SmartDNS 已安装并验证：$smartdns_version，127.0.0.1:53/udp+tcp。"
 }
 
 restore_resolv_conf() {
@@ -1985,58 +2139,264 @@ service_state() {
   printf '%s' "${state:-unknown}"
 }
 
+system_pretty_name() {
+  local pretty_name=''
+  if [[ -r /etc/os-release ]]; then
+    pretty_name=$(awk -F= '$1 == "PRETTY_NAME" {
+      sub(/^[^=]*=/, "")
+      gsub(/^"|"$/, "")
+      print
+      exit
+    }' /etc/os-release 2>/dev/null || true)
+  fi
+  printf '%s' "${pretty_name:-Debian ${DEBIAN_VERSION:-未知}}"
+}
+
+current_ufw_state() {
+  local status_output
+  if ! command -v ufw >/dev/null 2>&1; then
+    printf '未安装'
+    return 1
+  fi
+  status_output=$(ufw status 2>/dev/null || true)
+  if grep -q '^Status: active$' <<<"$status_output"; then
+    printf 'active'
+    return 0
+  fi
+  if grep -q '^Status: inactive$' <<<"$status_output"; then
+    printf 'inactive'
+  else
+    printf 'unknown'
+  fi
+  return 1
+}
+
+current_smartdns_state() {
+  local state
+  local udp_ready=false
+  local tcp_ready=false
+  if ! command -v smartdns >/dev/null 2>&1; then
+    printf '未安装'
+    return 1
+  fi
+  state=$(service_state smartdns.service)
+  if command -v ss >/dev/null 2>&1; then
+    ss -H -lun 'sport = :53' 2>/dev/null | grep -q '127\.0\.0\.1:53' && udp_ready=true
+    ss -H -ltn 'sport = :53' 2>/dev/null | grep -q '127\.0\.0\.1:53' && tcp_ready=true
+  fi
+  if [[ "$state" == 'active' && "$udp_ready" == true && "$tcp_ready" == true ]]; then
+    printf 'active，127.0.0.1:53/udp+tcp'
+    return 0
+  fi
+  if [[ "$state" == 'active' ]]; then
+    printf 'active，本地 UDP/TCP 监听未完整'
+  else
+    printf '%s' "$state"
+  fi
+  return 1
+}
+
+current_system_dns_state() {
+  local nameserver_count=0
+  if [[ -f /etc/resolv.conf ]]; then
+    nameserver_count=$(grep -Ec '^nameserver[[:space:]]+' /etc/resolv.conf 2>/dev/null || true)
+    if (( nameserver_count == 1 )) &&
+      grep -Eq '^nameserver[[:space:]]+127\.0\.0\.1$' /etc/resolv.conf; then
+      printf '仅 127.0.0.1'
+      return 0
+    fi
+  fi
+  printf '未验证为仅 127.0.0.1'
+  return 1
+}
+
+current_backup_state() {
+  if [[ -n "$BACKUP_DIR" && -d "$BACKUP_DIR" ]]; then
+    printf '%s' "$BACKUP_DIR"
+  elif [[ -n "$BACKUP_DIR" ]]; then
+    printf '%s（尚未创建）' "$BACKUP_DIR"
+  else
+    printf '未创建'
+  fi
+}
+
+print_ufw_port_result() {
+  local label=$1
+  local target=$2
+  local expected=$3
+  if [[ "$expected" == true ]]; then
+    if ufw_allows_port "$target"; then
+      result_row OK "$label" '已开放'
+    else
+      result_row FAIL "$label" '应开放但实际规则未通过验证'
+    fi
+  elif [[ -z "$(find_any_ufw_allow_rule "$target")" ]]; then
+    result_row OK "$label" '未开放'
+  else
+    result_row FAIL "$label" '发现非预期放行规则'
+  fi
+}
+
+print_failure_report() {
+  local failure_step=${FAILURE_STEP:-${CURRENT_STEP:-未知}}
+  local failure_reason=${FAILURE_REASON:-未知错误}
+  local ufw_state=''
+  local smartdns_state=''
+  local dns_state=''
+  RESULT_REPORTED=true
+
+  printf '\n'
+  result_box_line
+  color_text '38;5;208' '###                 VPS 初始化失败                       ###'
+  printf '\n'
+  result_box_line
+  result_row FAIL '失败步骤' "$failure_step"
+  result_row FAIL '错误原因' "$failure_reason"
+  case "$SSH_ROLLBACK_STATE" in
+    已回滚) result_row OK 'SSH 回滚' "$SSH_ROLLBACK_STATE" ;;
+    未触发) result_row INFO 'SSH 回滚' "$SSH_ROLLBACK_STATE" ;;
+    *) result_row WARN 'SSH 回滚' "$SSH_ROLLBACK_STATE" ;;
+  esac
+  if ufw_state=$(current_ufw_state); then
+    result_row OK 'UFW' "$ufw_state"
+  else
+    result_row WARN 'UFW' "$ufw_state"
+  fi
+  if smartdns_state=$(current_smartdns_state); then
+    result_row OK 'SmartDNS' "$smartdns_state"
+  else
+    result_row WARN 'SmartDNS' "$smartdns_state"
+  fi
+  if dns_state=$(current_system_dns_state); then
+    result_row OK '系统 DNS' "$dns_state"
+  else
+    result_row WARN '系统 DNS' "$dns_state"
+  fi
+  result_row INFO '备份目录' "$(current_backup_state)"
+  result_box_line
+}
+
 print_final_report() {
   CURRENT_STEP='输出最终报告'
-  local reboot_required='No'
+  local reboot_required='否'
   local update_state='已完成 full-upgrade'
-  local ssh_22_state='已关闭'
-  local tcp_443_state='未开放'
-  local udp_443_state='未开放'
-  local port_8443_state='未开放'
+  local bbr_control
+  local bbr_qdisc
+  local chrony_state
+  local ufw_state=''
+  local smartdns_state=''
+  local dns_state=''
   local sing_enabled
   local sing_active
   [[ -e /var/run/reboot-required ]] &&
-    reboot_required='Yes'
+    reboot_required='是'
   [[ "$SKIP_UPGRADE" == true ]] && update_state='已跳过 full-upgrade（已执行 apt-get update）'
-  [[ "$KEEP_SSH_22" == true ]] && ssh_22_state='已保留'
-  [[ "$OPEN_443_TCP" == true ]] && tcp_443_state='已开放'
-  [[ "$OPEN_443_UDP" == true ]] && udp_443_state='已开放'
-  [[ "$ENABLE_CF_8443" == true ]] && port_8443_state='Cloudflare-only'
+  chrony_state=$(service_state chrony.service)
+  bbr_control=$(read_sysctl net.ipv4.tcp_congestion_control)
+  bbr_qdisc=$(read_sysctl net.core.default_qdisc)
   sing_enabled=$(systemctl is-enabled sing-box.service 2>/dev/null || true)
   sing_active=$(service_state sing-box.service)
 
   printf '\n'
-  health_box_line
+  result_box_line
   color_text '38;5;208' '###                 VPS 初始化完成                       ###'
   printf '\n'
-  health_box_line
-  printf '%-20s %s\n' '安装模式' "$INSTALL_MODE"
-  printf '%-20s Debian %s\n' '系统版本' "$DEBIAN_VERSION"
-  printf '%-20s %s\n' '系统更新' "$update_state"
-  printf '%-20s %s\n' '基础工具' '已安装并验证'
-  printf '%-20s %s\n' 'chrony' "$(service_state chrony.service)"
-  printf '%-20s %s / %s\n' 'BBR/qdisc' \
-    "$(read_sysctl net.ipv4.tcp_congestion_control)" "$(read_sysctl net.core.default_qdisc)"
-  printf '%-20s %s/tcp\n' 'SSH 端口' "$SSH_PORT"
-  printf '%-20s %s\n' 'SSH 22' "$ssh_22_state"
-  printf '%-20s %s\n' 'root 密码登录' '已禁用（已由 sshd -T 验证）'
-  printf '%-20s %s\n' '443/tcp' "$tcp_443_state"
-  printf '%-20s %s\n' '443/udp' "$udp_443_state"
-  printf '%-20s %s\n' '8443/tcp' "$port_8443_state"
-  printf '%-20s %s\n' 'UFW' "$(ufw status | awk -F: '/^Status:/ { gsub(/^[[:space:]]+/, "", $2); print $2 }')"
-  printf '%-20s %s\n' 'Cloudflare UFW 工具' "$CLOUDFLARE_UFW_TOOL"
-  printf '%-20s installed，%s，%s\n' 'sing-box' "$sing_enabled" "$sing_active"
-  printf '%-20s %s，127.0.0.1:53/udp+tcp\n' 'SmartDNS' "$(service_state smartdns.service)"
-  if [[ "$DNS_READY" == true ]]; then
-    printf '%-20s %s\n' '系统 DNS' '仅 127.0.0.1（已验证）'
+  result_box_line
+  result_row INFO '安装模式' "$INSTALL_MODE"
+  result_row OK '系统版本' "$(system_pretty_name)"
+  if [[ "$SYSTEM_UPDATE_READY" == true ]]; then
+    result_row OK '系统更新' "$update_state"
   else
-    printf '%-20s %s\n' '系统 DNS' '未通过验证'
+    result_row FAIL '系统更新' '未完成验证'
   fi
-  printf '%-20s %s\n' 'RealityChecker' "$REALITY_CHECKER_STATE"
-  printf '%-20s %s\n' '备份目录' "$BACKUP_DIR"
-  printf '%-20s %s\n' '是否需要重启' "$reboot_required"
-  health_box_line
-  printf '未执行外部 SSH 登录确认；请保持当前会话并自行验证新端口。\n'
+  if [[ "$BASE_TOOLS_READY" == true ]]; then
+    result_row OK '基础工具' '已安装并验证'
+  else
+    result_row FAIL '基础工具' '未完成验证'
+  fi
+  if [[ "$chrony_state" == 'active' ]]; then
+    result_row OK 'chrony' "$chrony_state"
+  else
+    result_row FAIL 'chrony' "$chrony_state"
+  fi
+  if [[ "$bbr_control" == 'bbr' && "$bbr_qdisc" == 'fq' ]]; then
+    result_row OK 'BBR' "$bbr_control / $bbr_qdisc"
+  else
+    result_row WARN 'BBR' "$bbr_control / $bbr_qdisc"
+  fi
+  if [[ "$SSH_READY" == true ]] && is_tcp_port_listening "$SSH_PORT"; then
+    result_row OK 'SSH 端口' "$SSH_PORT/tcp"
+  else
+    result_row FAIL 'SSH 端口' "$SSH_PORT/tcp 未通过监听验证"
+  fi
+  if [[ "$KEEP_SSH_22" == true ]]; then
+    if is_tcp_port_listening 22; then
+      result_row OK 'SSH 22' '已保留'
+    else
+      result_row FAIL 'SSH 22' '应保留但未监听'
+    fi
+  elif is_tcp_port_listening 22; then
+    result_row FAIL 'SSH 22' '仍在监听'
+  else
+    result_row OK 'SSH 22' '已关闭'
+  fi
+  if [[ "$SSH_READY" == true ]]; then
+    result_row OK 'root 登录' '仅允许公钥'
+  else
+    result_row FAIL 'root 登录' '最终策略未通过验证'
+  fi
+  print_ufw_port_result '443/tcp' '443/tcp' "$OPEN_443_TCP"
+  print_ufw_port_result '443/udp' '443/udp' "$OPEN_443_UDP"
+  if [[ "$ENABLE_CF_8443" == true ]]; then
+    if ufw_has_comment 'Cloudflare-8443' && [[ -z "$(find_unmanaged_8443_rule)" ]]; then
+      result_row OK '8443/tcp' 'Cloudflare-only'
+    else
+      result_row FAIL '8443/tcp' 'Cloudflare-only 规则未通过验证'
+    fi
+  elif ! ufw_has_comment 'Cloudflare-8443' &&
+    [[ -z "$(find_any_ufw_allow_rule '8443/tcp')" ]]; then
+    result_row OK '8443/tcp' '未开放'
+  else
+    result_row FAIL '8443/tcp' '发现非预期放行规则'
+  fi
+  if ufw_state=$(current_ufw_state); then
+    result_row OK 'UFW' "$ufw_state"
+  else
+    result_row FAIL 'UFW' "$ufw_state"
+  fi
+  if [[ -x "$CLOUDFLARE_UFW_TOOL" ]] &&
+    [[ $(stat -c '%U:%G:%a' "$CLOUDFLARE_UFW_TOOL" 2>/dev/null || true) == 'root:root:755' ]]; then
+    result_row OK 'Cloudflare UFW 工具' "$CLOUDFLARE_UFW_TOOL"
+  else
+    result_row FAIL 'Cloudflare UFW 工具' '文件或权限未通过验证'
+  fi
+  if command -v sing-box >/dev/null 2>&1 &&
+    [[ "$sing_enabled" == 'disabled' && "$sing_active" == 'inactive' ]]; then
+    result_row OK 'sing-box' "installed，$sing_enabled，$sing_active"
+  else
+    result_row WARN 'sing-box' "${sing_enabled:-未安装}，$sing_active"
+  fi
+  if smartdns_state=$(current_smartdns_state); then
+    result_row OK 'SmartDNS' "$smartdns_state"
+  else
+    result_row FAIL 'SmartDNS' "$smartdns_state"
+  fi
+  if [[ "$DNS_READY" == true ]] && dns_state=$(current_system_dns_state); then
+    result_row OK '系统 DNS' "$dns_state"
+  else
+    [[ -n "$dns_state" ]] || dns_state='未通过安装流程验证'
+    result_row FAIL '系统 DNS' "$dns_state"
+  fi
+  if [[ "$REALITY_CHECKER_STATE" == '已安装' && -x /usr/local/bin/reality-checker ]]; then
+    result_row OK 'RealityChecker' "$REALITY_CHECKER_STATE"
+  else
+    result_row WARN 'RealityChecker' "$REALITY_CHECKER_STATE"
+  fi
+  result_row INFO '备份目录' "$(current_backup_state)"
+  result_row INFO '建议重启' "$reboot_required"
+  result_row WARN 'SSH 外部确认' '未执行；请保持当前会话并自行验证新端口'
+  result_box_line
+  RESULT_REPORTED=true
 }
 
 custom_phase_one() {
@@ -2077,8 +2437,8 @@ run_remaining_initialization() {
 }
 
 main() {
-  parse_args "$@"
   initialize_colors
+  parse_args "$@"
   run_health_check
   [[ -r /dev/tty && -w /dev/tty ]] ||
     die '体检已完成，但当前没有交互式 /dev/tty；未执行任何安装或配置修改。'
