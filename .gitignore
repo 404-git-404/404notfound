@@ -1,0 +1,32 @@
+# Editors and operating systems
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Local logs and temporary files
+*.log
+*.tmp
+*.bak
+
+# Secrets and key material
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+*.cer
+*.pub
+id_rsa*
+id_ed25519*
+
+# Node or Python tooling used only for local checks
+node_modules/
+__pycache__/
+.pytest_cache/
+.venv/
