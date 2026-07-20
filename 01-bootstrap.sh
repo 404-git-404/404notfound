@@ -9,14 +9,21 @@ export DEBIAN_FRONTEND=noninteractive
 export LC_ALL=C
 
 readonly DEFAULT_SSH_PORT='53651'
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+readonly SCRIPT_DIR
 readonly SSH_MAIN_CONFIG='/etc/ssh/sshd_config'
 readonly SSH_DROPIN_DIR='/etc/ssh/sshd_config.d'
-readonly SSH_DROPIN="$SSH_DROPIN_DIR/00-vps-bootstrap.conf"
+readonly SSH_DROPIN="$SSH_DROPIN_DIR/00-hardening.conf"
+readonly LEGACY_SSH_DROPIN="$SSH_DROPIN_DIR/00-vps-bootstrap.conf"
 readonly AUTHORIZED_KEYS='/root/.ssh/authorized_keys'
+readonly SMARTDNS_CONFIG_SOURCE="$SCRIPT_DIR/configs/smartdns.conf"
+readonly CLOUDFLARE_UFW_SCRIPT="$SCRIPT_DIR/scripts/update-cloudflare-ufw.sh"
 readonly SAGER_KEY_FINGERPRINT='2C317FBD5D886B4E89BAE8DA6D9152172A2B2F0C'
+readonly DEFAULT_REALITY_CHECKER_REPOSITORY='V2RaySSR/RealityChecker'
 
 SSH_PORT="$DEFAULT_SSH_PORT"
 SING_BOX_VERSION=''
+REALITY_CHECKER_REPOSITORY="$DEFAULT_REALITY_CHECKER_REPOSITORY"
 PUBKEY_ARGUMENT=''
 PUBKEY_FILE=''
 PUBLIC_KEY=''
@@ -24,6 +31,11 @@ PUBLIC_KEY_TYPE=''
 PUBLIC_KEY_BLOB=''
 PUBLIC_KEY_FINGERPRINT=''
 SKIP_UPGRADE=false
+INSTALL_MODE=''
+KEEP_SSH_22=false
+OPEN_443_TCP=true
+OPEN_443_UDP=true
+ENABLE_CF_8443=false
 CURRENT_STEP='启动'
 TMP_DIR=''
 BACKUP_DIR=''
@@ -32,29 +44,50 @@ CPU_ARCH=''
 SSHD_EFFECTIVE=''
 SSHD_EFFECTIVE_ROOT=''
 SSH_READY=false
+SMARTDNS_READY=false
+DNS_READY=false
+REALITY_CHECKER_STATE='安装失败'
 LAST_WRITE_CHANGED=false
+COLOR_ENABLED=false
+HEALTH_BLOCKERS=0
+HEALTH_WARNINGS=0
+INITIAL_SSH_PORTS=''
 declare -a SSH_CHANGED_FILES=()
+declare -a HEALTH_STATUSES=()
+declare -a HEALTH_LABELS=()
+declare -a HEALTH_DETAILS=()
 
 readonly -a BASE_PACKAGES=(
-  sudo ca-certificates curl wget git rsync tar unzip xz-utils jq nano gnupg
+  ca-certificates curl wget git rsync tar unzip xz-utils jq nano gnupg
   openssl socat cron openssh-server ufw dnsutils iproute2 iputils-ping
   netcat-openbsd mtr-tiny traceroute tcpdump procps lsof htop chrony vnstat
+  python3 util-linux file
 )
 
 usage() {
   cat <<'EOF'
 用法：
-  bash 01-bootstrap.sh [选项]
+  bash 01-bootstrap.sh
+  bash 01-bootstrap.sh [预设选项]
 
-选项：
-  --pubkey "SSH_PUBLIC_KEY"       直接提供一个 OpenSSH 公钥
-  --pubkey-file /path/key.pub     从文件读取一个 OpenSSH 公钥（优先级更高）
-  --ssh-port PORT                 SSH 端口，默认 53651；不能为 22
+脚本首先执行完全只读的 VPS 环境体检，然后显示：
+  1. 快速安装
+  2. 自定义安装
+  3. 退出
+
+快速安装固定使用 53651/tcp，关闭 22，开放 443/tcp、443/udp，
+并仅向 Cloudflare 地址段开放 8443/tcp。
+
+预设选项（不会跳过体检和菜单）：
+  --pubkey "SSH_PUBLIC_KEY"       预先提供一个 OpenSSH 公钥
+  --pubkey-file /path/key.pub     从文件读取公钥（优先级更高）
   --sing-box-version VERSION      安装官方 APT 仓库中的指定 sing-box 版本
-  --skip-upgrade                  只执行 apt-get update，跳过 full-upgrade
+  --reality-checker-repo O/R      覆盖 RealityChecker GitHub OWNER/REPO
   --help                          显示帮助
 
-如果没有提供公钥且 /dev/tty 可交互，脚本会提示粘贴公钥。
+RealityChecker 默认仓库：V2RaySSR/RealityChecker。
+所有交互均从 /dev/tty 读取。无 TTY 时，体检完成后明确退出。
+SmartDNS 验证成功后会成为系统唯一 DNS；脚本不执行外部 SSH 登录确认。
 EOF
 }
 
@@ -96,6 +129,337 @@ trap 'on_error $LINENO' ERR
 trap cleanup EXIT
 trap 'warn "收到中断信号，停止执行。"; exit 130' INT TERM
 
+initialize_colors() {
+  if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+    COLOR_ENABLED=true
+  fi
+}
+
+color_text() {
+  local color=$1
+  local text=$2
+  if [[ "$COLOR_ENABLED" == true ]]; then
+    printf '\033[%sm%s\033[0m' "$color" "$text"
+  else
+    printf '%s' "$text"
+  fi
+}
+
+health_add() {
+  local status=$1
+  local label=$2
+  local detail=$3
+  HEALTH_STATUSES+=("$status")
+  HEALTH_LABELS+=("$label")
+  HEALTH_DETAILS+=("$detail")
+  case "$status" in
+    FAIL) ((HEALTH_BLOCKERS += 1)) ;;
+    WARN) ((HEALTH_WARNINGS += 1)) ;;
+  esac
+}
+
+health_status_text() {
+  local status=$1
+  case "$status" in
+    OK) color_text '32' '[OK]  ' ;;
+    WARN) color_text '33' '[WARN]' ;;
+    FAIL) color_text '31' '[FAIL]' ;;
+    *) printf '[INFO]' ;;
+  esac
+}
+
+health_box_line() {
+  color_text '38;5;208' '############################################################'
+  printf '\n'
+}
+
+read_tty() {
+  local prompt=$1
+  local variable_name=$2
+  [[ -r /dev/tty && -w /dev/tty ]] ||
+    die '当前没有可交互的 /dev/tty，无法安全读取安装选择。'
+  printf '%s' "$prompt" >/dev/tty
+  IFS= read -r "${variable_name?}" </dev/tty || die '无法从 /dev/tty 读取输入。'
+}
+
+ask_yes_no() {
+  local prompt=$1
+  local default_value=$2
+  local answer
+  while true; do
+    if [[ "$default_value" == true ]]; then
+      read_tty "$prompt [Y/n] " answer
+      answer=${answer:-Y}
+    else
+      read_tty "$prompt [y/N] " answer
+      answer=${answer:-N}
+    fi
+    case "${answer,,}" in
+      y|yes) return 0 ;;
+      n|no) return 1 ;;
+      *) printf '请输入 y 或 n。\n' >/dev/tty ;;
+    esac
+  done
+}
+
+shorten_line() {
+  local value=$1
+  value=${value//$'\n'/; }
+  printf '%.160s' "$value"
+}
+
+collect_ssh_listener_ports() {
+  command -v ss >/dev/null 2>&1 || return 0
+  ss -H -ltnp 2>/dev/null | awk '
+    /sshd/ {
+      endpoint = $4
+      sub(/^.*:/, "", endpoint)
+      if (endpoint ~ /^[0-9]+$/) {
+        ports[endpoint] = 1
+      }
+    }
+    END {
+      separator = ""
+      for (port in ports) {
+        printf "%s%s", separator, port
+        separator = ","
+      }
+    }
+  '
+}
+
+run_health_check() {
+  CURRENT_STEP='启动体检'
+  HEALTH_BLOCKERS=0
+  HEALTH_WARNINGS=0
+  HEALTH_STATUSES=()
+  HEALTH_LABELS=()
+  HEALTH_DETAILS=()
+
+  local os_id='未知'
+  local os_version='未知'
+  local os_pretty='无法读取 /etc/os-release'
+  if [[ -r /etc/os-release ]]; then
+    os_id=$(awk -F= '$1 == "ID" { gsub(/^"|"$/, "", $2); print $2 }' /etc/os-release)
+    os_version=$(awk -F= '$1 == "VERSION_ID" { gsub(/^"|"$/, "", $2); print $2 }' /etc/os-release)
+    os_pretty=$(awk -F= '$1 == "PRETTY_NAME" { sub(/^[^=]*=/, ""); gsub(/^"|"$/, ""); print }' /etc/os-release)
+  fi
+  if [[ "$os_id" == debian && "$os_version" =~ ^(12|13)$ ]]; then
+    health_add OK '系统版本' "$os_pretty"
+  else
+    health_add FAIL '系统版本' "$os_pretty；仅支持 Debian 12/13"
+  fi
+
+  if (( EUID == 0 )); then
+    health_add OK '运行用户' 'root'
+  else
+    health_add FAIL '运行用户' "UID=$EUID；必须使用 root"
+  fi
+
+  local architecture
+  architecture=$(dpkg --print-architecture 2>/dev/null || uname -m 2>/dev/null || printf '未知')
+  case "$architecture" in
+    amd64|arm64) health_add OK 'CPU 架构' "$architecture" ;;
+    *) health_add FAIL 'CPU 架构' "$architecture；仅支持 amd64/arm64" ;;
+  esac
+
+  if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1; then
+    health_add OK 'systemd' '可用'
+  else
+    health_add FAIL 'systemd' '不可用'
+  fi
+
+  if command -v systemctl >/dev/null 2>&1 &&
+    systemctl cat ssh.service >/dev/null 2>&1; then
+    if systemctl is-active --quiet ssh.service; then
+      INITIAL_SSH_PORTS=$(collect_ssh_listener_ports)
+      health_add OK 'SSH 服务' "active，监听 ${INITIAL_SSH_PORTS:-未识别}/tcp"
+    else
+      health_add FAIL 'SSH 服务' 'ssh.service 存在但未运行'
+    fi
+  else
+    health_add FAIL 'SSH 服务' '找不到 ssh.service'
+  fi
+
+  local cpu_count='未知'
+  local cpu_model='未知'
+  command -v nproc >/dev/null 2>&1 && cpu_count=$(nproc)
+  [[ -r /proc/cpuinfo ]] &&
+    cpu_model=$(awk -F: '/model name|Processor/ { sub(/^[[:space:]]+/, "", $2); print $2; exit }' /proc/cpuinfo)
+  health_add INFO 'CPU' "${cpu_count} 核，${cpu_model:-未知型号}"
+
+  local memory='未知'
+  [[ -r /proc/meminfo ]] &&
+    memory=$(awk '/MemTotal:/ { printf "%.1f GiB", $2 / 1048576 }' /proc/meminfo)
+  health_add INFO '内存' "$memory"
+
+  local disk_available_kb=0
+  local disk_detail='无法读取'
+  if command -v df >/dev/null 2>&1; then
+    disk_available_kb=$(df -Pk / | awk 'NR == 2 { print $4 }')
+    disk_detail=$(df -Ph / | awk 'NR == 2 { printf "可用 %s，共 %s，已用 %s", $4, $2, $5 }')
+  fi
+  if (( disk_available_kb < 2097152 )); then
+    health_add FAIL '根磁盘' "$disk_detail；至少需要 2 GiB 可用空间"
+  else
+    health_add OK '根磁盘' "$disk_detail"
+  fi
+
+  local ip_detail='ip 命令不可用'
+  local route_detail='未发现默认路由'
+  if command -v ip >/dev/null 2>&1; then
+    ip_detail=$(ip -brief address show scope global 2>/dev/null | awk '{$1=$1; print}' | head -n 4 || true)
+    route_detail=$(
+      {
+        ip -4 route show default 2>/dev/null || true
+        ip -6 route show default 2>/dev/null || true
+      } | awk 'NR <= 4' || true
+    )
+  fi
+  health_add INFO 'IP 地址' "$(shorten_line "${ip_detail:-无全局地址}")"
+  health_add INFO '默认路由' "$(shorten_line "${route_detail:-未发现}")"
+
+  local listener_detail='ss 命令不可用'
+  if command -v ss >/dev/null 2>&1; then
+    listener_detail=$(ss -H -lntu 2>/dev/null | awk '
+      {
+        endpoint = $1 ":" $5
+        entries[endpoint] = 1
+      }
+      END {
+        separator = ""
+        for (endpoint in entries) {
+          printf "%s%s", separator, endpoint
+          separator = ", "
+        }
+      }
+    ' || true)
+  fi
+  health_add INFO '监听端口' "$(shorten_line "${listener_detail:-无监听}")"
+
+  if command -v timeout >/dev/null 2>&1 && command -v getent >/dev/null 2>&1 &&
+    timeout 4 getent ahosts debian.org >/dev/null 2>&1; then
+    health_add OK 'DNS 解析' 'debian.org 解析成功'
+  else
+    health_add WARN 'DNS 解析' '短时解析测试失败'
+  fi
+
+  if command -v timeout >/dev/null 2>&1 && command -v ping >/dev/null 2>&1 &&
+    timeout 5 ping -4 -c 1 -W 2 debian.org >/dev/null 2>&1; then
+    health_add OK 'IPv4 网络' '可用'
+  else
+    health_add WARN 'IPv4 网络' '短时连通性测试失败'
+  fi
+  if command -v timeout >/dev/null 2>&1 && command -v ping >/dev/null 2>&1 &&
+    timeout 5 ping -6 -c 1 -W 2 debian.org >/dev/null 2>&1; then
+    health_add OK 'IPv6 网络' '可用'
+  else
+    health_add WARN 'IPv6 网络' '不可用或短时测试失败'
+  fi
+
+  if [[ ! -r /var/lib/dpkg/status ]] || ! command -v dpkg >/dev/null 2>&1; then
+    health_add FAIL 'dpkg 状态' '状态数据库不可读或 dpkg 缺失'
+  else
+    local audit_output
+    audit_output=$(dpkg --audit 2>&1 || true)
+    if [[ -n "$audit_output" ]]; then
+      health_add FAIL 'dpkg 状态' "$(shorten_line "$audit_output")"
+    else
+      health_add OK 'dpkg 状态' '未发现未配置或损坏的软件包'
+    fi
+  fi
+  if ! command -v lslocks >/dev/null 2>&1; then
+    health_add WARN 'APT/dpkg 锁' 'lslocks 不可用，安装时将依赖 APT 自身锁等待'
+  elif apt_lock_is_held; then
+    health_add WARN 'APT/dpkg 锁' '正被其他进程占用；安装时最多等待 300 秒'
+  else
+    health_add OK 'APT/dpkg 锁' '未占用'
+  fi
+
+  local time_detail
+  time_detail=$(date --iso-8601=seconds 2>/dev/null || date)
+  if command -v timedatectl >/dev/null 2>&1; then
+    time_detail+="，同步=$(timedatectl show -p NTPSynchronized --value 2>/dev/null || printf '未知')"
+  fi
+  health_add INFO '时间同步' "$time_detail"
+
+  if command -v ufw >/dev/null 2>&1; then
+    if ufw_is_active; then
+      health_add INFO 'UFW 状态' 'installed，active'
+    else
+      health_add INFO 'UFW 状态' 'installed，inactive'
+    fi
+  else
+    health_add INFO 'UFW 状态' '未安装'
+  fi
+
+  health_add INFO 'BBR/qdisc' "$(read_sysctl net.ipv4.tcp_congestion_control) / $(read_sysctl net.core.default_qdisc)"
+  if command -v sing-box >/dev/null 2>&1; then
+    health_add INFO 'sing-box' "已安装，$(service_state sing-box.service)"
+  else
+    health_add INFO 'sing-box' '未安装'
+  fi
+  if command -v smartdns >/dev/null 2>&1; then
+    health_add INFO 'SmartDNS' "已安装，$(service_state smartdns.service)"
+  else
+    health_add INFO 'SmartDNS' '未安装'
+  fi
+
+  local virtualization='未知'
+  command -v systemd-detect-virt >/dev/null 2>&1 &&
+    virtualization=$(systemd-detect-virt 2>/dev/null || printf 'none')
+  health_add INFO '虚拟化' "$virtualization"
+
+  print_health_report
+}
+
+print_health_report() {
+  local index
+  printf '\n'
+  health_box_line
+  color_text '38;5;208' '###                 VPS 环境体检结果                     ###'
+  printf '\n'
+  health_box_line
+  for index in "${!HEALTH_STATUSES[@]}"; do
+    health_status_text "${HEALTH_STATUSES[$index]}"
+    printf ' %-14s %s\n' "${HEALTH_LABELS[$index]}" "${HEALTH_DETAILS[$index]}"
+  done
+  if (( HEALTH_BLOCKERS > 0 )); then
+    color_text '31' "结论：发现 $HEALTH_BLOCKERS 项阻断问题和 $HEALTH_WARNINGS 项警告，不能进入安装。"
+  elif (( HEALTH_WARNINGS > 0 )); then
+    color_text '33' "结论：环境符合安装要求，发现 $HEALTH_WARNINGS 项非阻断警告。"
+  else
+    color_text '32' '结论：环境符合安装要求，未发现阻断问题。'
+  fi
+  printf '\n'
+  health_box_line
+}
+
+select_install_mode() {
+  local choice
+  while true; do
+    if (( HEALTH_BLOCKERS > 0 )); then
+      printf '\n1. 重新体检\n2. 退出\n' >/dev/tty
+      read_tty '请选择 [1-2]: ' choice
+      case "$choice" in
+        1) run_health_check ;;
+        2) exit 1 ;;
+        *) printf '无效选择。\n' >/dev/tty ;;
+      esac
+      continue
+    fi
+
+    printf '\n1. 快速安装\n2. 自定义安装\n3. 退出\n' >/dev/tty
+    read_tty '请选择 [1-3]: ' choice
+    case "$choice" in
+      1) INSTALL_MODE='快速安装'; return 0 ;;
+      2) INSTALL_MODE='自定义安装'; return 0 ;;
+      3) exit 0 ;;
+      *) printf '无效选择。\n' >/dev/tty ;;
+    esac
+  done
+}
+
 require_option_value() {
   local option=$1
   local count=$2
@@ -117,19 +481,15 @@ parse_args() {
         PUBKEY_FILE=$2
         shift 2
         ;;
-      --ssh-port)
-        require_option_value "$1" "$#"
-        SSH_PORT=$2
-        shift 2
-        ;;
       --sing-box-version)
         require_option_value "$1" "$#"
         SING_BOX_VERSION=${2#v}
         shift 2
         ;;
-      --skip-upgrade)
-        SKIP_UPGRADE=true
-        shift
+      --reality-checker-repo)
+        require_option_value "$1" "$#"
+        REALITY_CHECKER_REPOSITORY=$2
+        shift 2
         ;;
       --help|-h)
         usage
@@ -141,14 +501,103 @@ parse_args() {
     esac
   done
 
-  [[ "$SSH_PORT" =~ ^[0-9]+$ ]] || die 'SSH 端口必须是数字。'
-  (( ${#SSH_PORT} <= 5 )) || die 'SSH 端口长度无效。'
-  (( 10#$SSH_PORT >= 1 && 10#$SSH_PORT <= 65535 )) ||
-    die 'SSH 端口必须在 1 到 65535 之间。'
-  (( 10#$SSH_PORT != 22 )) || die '为满足安全目标，--ssh-port 不能设置为 22。'
+  validate_ssh_port "$SSH_PORT"
   if [[ -n "$SING_BOX_VERSION" ]]; then
     [[ "$SING_BOX_VERSION" =~ ^[0-9A-Za-z.+:~_-]+$ ]] ||
       die 'sing-box 版本包含不允许的字符。'
+  fi
+  if [[ -n "$REALITY_CHECKER_REPOSITORY" ]]; then
+    [[ "$REALITY_CHECKER_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] ||
+      die 'RealityChecker 仓库必须使用 GitHub OWNER/REPO 格式。'
+  fi
+}
+
+validate_ssh_port() {
+  local port=$1
+  [[ "$port" =~ ^[0-9]+$ ]] || die 'SSH 端口必须是数字。'
+  (( ${#port} <= 5 )) || die 'SSH 端口长度无效。'
+  (( 10#$port >= 1 && 10#$port <= 65535 )) ||
+    die 'SSH 端口必须在 1 到 65535 之间。'
+  (( 10#$port != 22 )) ||
+    die '新 SSH 端口不能是 22；如需继续使用 22，请选择“保留 SSH 22/tcp”。'
+  case "$port" in
+    53|80|443|8443) die "$port 是已知 DNS/Web/代理业务端口，不能用作 SSH 端口。" ;;
+  esac
+}
+
+ssh_port_has_conflict() {
+  local port=$1
+  local listeners
+  listeners=$(ss -H -ltnp "sport = :$port" 2>/dev/null || true)
+  [[ -z "$listeners" ]] && return 1
+  grep -qv 'sshd' <<<"$listeners"
+}
+
+choose_custom_ssh_port() {
+  local choice
+  local candidate
+  while true; do
+    printf '\nSSH 端口：\n1. 使用默认端口 53651\n2. 输入自定义端口\n' >/dev/tty
+    read_tty '请选择 [1-2]: ' choice
+    case "$choice" in
+      1) candidate=$DEFAULT_SSH_PORT ;;
+      2) read_tty '请输入新的 SSH 端口: ' candidate ;;
+      *) printf '无效选择。\n' >/dev/tty; continue ;;
+    esac
+    if ! [[ "$candidate" =~ ^[0-9]+$ ]] || (( ${#candidate} > 5 )) ||
+      (( 10#$candidate < 1 || 10#$candidate > 65535 )); then
+      printf '端口必须是 1–65535 之间的数字。\n' >/dev/tty
+      continue
+    fi
+    if (( 10#$candidate == 22 )); then
+      printf '22 不能作为“新端口”；稍后可单独选择是否保留 22/tcp。\n' >/dev/tty
+      continue
+    fi
+    case "$candidate" in
+      53|80|443|8443)
+        printf '%s 是已知业务端口，请选择其他 SSH 端口。\n' "$candidate" >/dev/tty
+        continue
+        ;;
+    esac
+    if ssh_port_has_conflict "$candidate"; then
+      printf '%s/tcp 已被非 sshd 进程监听，请选择其他端口。\n' "$candidate" >/dev/tty
+      continue
+    fi
+    SSH_PORT=$candidate
+    return 0
+  done
+}
+
+configure_quick_choices() {
+  SSH_PORT=$DEFAULT_SSH_PORT
+  SKIP_UPGRADE=false
+  KEEP_SSH_22=false
+  OPEN_443_TCP=true
+  OPEN_443_UDP=true
+  ENABLE_CF_8443=true
+}
+
+configure_custom_network_choices() {
+  choose_custom_ssh_port
+  if ask_yes_no '是否保留 SSH 22/tcp？' false; then
+    KEEP_SSH_22=true
+  else
+    KEEP_SSH_22=false
+  fi
+  if ask_yes_no '是否放行 443/tcp？' true; then
+    OPEN_443_TCP=true
+  else
+    OPEN_443_TCP=false
+  fi
+  if ask_yes_no '是否放行 443/udp？' true; then
+    OPEN_443_UDP=true
+  else
+    OPEN_443_UDP=false
+  fi
+  if ask_yes_no '是否仅允许 Cloudflare IP 访问 8443/tcp？' false; then
+    ENABLE_CF_8443=true
+  else
+    ENABLE_CF_8443=false
   fi
 }
 
@@ -177,6 +626,10 @@ preflight() {
   command -v apt-get >/dev/null 2>&1 || die '缺少 apt-get。'
   command -v mktemp >/dev/null 2>&1 || die '缺少 mktemp。'
   command -v base64 >/dev/null 2>&1 || die '缺少 base64。'
+  [[ -s "$SMARTDNS_CONFIG_SOURCE" ]] ||
+    die "缺少或无法读取 SmartDNS 配置：$SMARTDNS_CONFIG_SOURCE"
+  [[ -s "$CLOUDFLARE_UFW_SCRIPT" ]] ||
+    die "缺少 Cloudflare UFW 更新脚本：$CLOUDFLARE_UFW_SCRIPT"
 
   TMP_DIR=$(mktemp -d -t 404notfound-bootstrap.XXXXXXXX)
   BACKUP_DIR="/var/backups/404notfound-bootstrap/$(date -u '+%Y%m%dT%H%M%SZ')-$$"
@@ -256,13 +709,125 @@ apt_get() {
   apt-get -o DPkg::Lock::Timeout=300 "$@"
 }
 
+find_mismatched_debian_suites() {
+  local expected=$1
+  local source_file
+  local -a source_files=()
+  [[ -f /etc/apt/sources.list ]] && source_files+=(/etc/apt/sources.list)
+  shopt -s nullglob
+  source_files+=(/etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources)
+  shopt -u nullglob
+  for source_file in "${source_files[@]}"; do
+    awk -v expected="$expected" -v source_file="$source_file" '
+      function allowed(suite) {
+        return suite == expected || index(suite, expected "-") == 1
+      }
+      function check_deb822(  count, i, suites_array) {
+        if (official && suites != "") {
+          count = split(suites, suites_array, /[[:space:]]+/)
+          for (i = 1; i <= count; i++) {
+            if (suites_array[i] != "" && !allowed(suites_array[i])) {
+              print source_file ":" suites_array[i]
+            }
+          }
+        }
+        official = 0
+        suites = ""
+      }
+      /^[[:space:]]*#/ { next }
+      $1 == "deb" || $1 == "deb-src" {
+        uri_index = 0
+        for (i = 2; i <= NF; i++) {
+          if ($i ~ /^https?:\/\//) {
+            uri_index = i
+            break
+          }
+        }
+        if (uri_index > 0 &&
+            $(uri_index) ~ /(deb\.debian\.org\/debian|security\.debian\.org)/ &&
+            !allowed($(uri_index + 1))) {
+          print source_file ":" $(uri_index + 1)
+        }
+        next
+      }
+      /^URIs:[[:space:]]*/ {
+        official = ($0 ~ /(deb\.debian\.org\/debian|security\.debian\.org)/)
+        next
+      }
+      /^Suites:[[:space:]]*/ {
+        suites = $0
+        sub(/^Suites:[[:space:]]*/, "", suites)
+        next
+      }
+      /^[[:space:]]*$/ { check_deb822(); next }
+      END { check_deb822() }
+    ' "$source_file"
+  done
+}
+
+validate_current_debian_release_sources() {
+  local expected_codename
+  local mismatches
+  case "$DEBIAN_VERSION" in
+    12) expected_codename='bookworm' ;;
+    13) expected_codename='trixie' ;;
+    *) die '无法确定当前 Debian 大版本对应的 APT 代号。' ;;
+  esac
+  mismatches=$(find_mismatched_debian_suites "$expected_codename")
+  [[ -z "$mismatches" ]] ||
+    die "官方 Debian APT 源不是当前大版本 $expected_codename，拒绝 full-upgrade：$mismatches"
+}
+
+validate_current_debian_apt_policy() {
+  local expected_codename
+  local policy_result
+  case "$DEBIAN_VERSION" in
+    12) expected_codename='bookworm' ;;
+    13) expected_codename='trixie' ;;
+    *) die '无法确定当前 Debian 大版本对应的 APT 代号。' ;;
+  esac
+  policy_result=$(apt-cache policy | awk -v expected="$expected_codename" '
+    /^[[:space:]]*release[[:space:]]/ && /(^|,)o=Debian(,|$)/ {
+      line = $0
+      sub(/^[[:space:]]*release[[:space:]]+/, "", line)
+      count = split(line, fields, /,/)
+      suite = ""
+      for (i = 1; i <= count; i++) {
+        if (fields[i] ~ /^n=/) {
+          suite = fields[i]
+          sub(/^n=/, "", suite)
+        }
+      }
+      if (suite == expected || index(suite, expected "-") == 1) {
+        found_expected = 1
+      } else if (suite != "") {
+        mismatches[suite] = 1
+      }
+    }
+    END {
+      for (suite in mismatches) {
+        print "MISMATCH:" suite
+      }
+      if (!found_expected) {
+        print "MISSING:" expected
+      }
+    }
+  ')
+  [[ -z "$policy_result" ]] ||
+    die "APT 元数据未限定在当前 Debian 大版本，拒绝 full-upgrade：$policy_result"
+}
+
 update_system() {
   CURRENT_STEP='更新系统'
+  if [[ "$SKIP_UPGRADE" == false ]]; then
+    validate_current_debian_release_sources
+  fi
   log '刷新 APT 软件包索引。'
   apt_get update
   if [[ "$SKIP_UPGRADE" == true ]]; then
-    log '已通过 --skip-upgrade 跳过 full-upgrade。'
+    log '自定义模式已选择跳过 full-upgrade。'
   else
+    validate_current_debian_apt_policy
     log '执行非交互式 full-upgrade；不会自动重启。'
     apt_get full-upgrade -y
   fi
@@ -274,9 +839,9 @@ install_base_packages() {
   apt_get install -y "${BASE_PACKAGES[@]}"
 
   local -a required_commands=(
-    sudo curl wget git rsync tar unzip xz jq nano gpg openssl socat cron
+    curl wget git rsync tar unzip xz jq nano gpg openssl socat cron
     crontab ssh sshd ssh-keygen ufw dig ip ss ping nc mtr traceroute
-    tcpdump ps lsof htop chronyd chronyc vnstat
+    tcpdump ps lsof htop chronyd chronyc vnstat python3 flock file
   )
   local command_name
   for command_name in "${required_commands[@]}"; do
@@ -353,6 +918,7 @@ write_managed_file() {
 configure_chrony() {
   CURRENT_STEP='配置时间同步'
   systemctl enable --now chrony.service
+  chronyc makestep || warn 'chronyc makestep 暂时失败；chrony 将继续在后台同步。'
   log 'timedatectl 状态：'
   timedatectl status || warn 'timedatectl 暂时无法返回完整状态。'
   log 'chrony 跟踪状态：'
@@ -427,6 +993,7 @@ neutralize_ssh_conflicts() {
       blocked["challengeresponseauthentication"] = 1
       blocked["permitemptypasswords"] = 1
       blocked["usepam"] = 1
+      blocked["x11forwarding"] = 1
     }
     {
       trimmed = $0
@@ -477,7 +1044,7 @@ ensure_bootstrap_include_first() {
   {
     printf '%s\n' \
       '# BEGIN 404NOTFOUND BOOTSTRAP INCLUDE' \
-      'Include /etc/ssh/sshd_config.d/00-vps-bootstrap.conf' \
+      'Include /etc/ssh/sshd_config.d/00-hardening.conf' \
       '# END 404NOTFOUND BOOTSTRAP INCLUDE' \
       ''
     cat "$cleaned_file"
@@ -492,9 +1059,16 @@ ensure_bootstrap_include_first() {
 
 write_ssh_dropin() {
   [[ ! -L "$SSH_DROPIN" ]] || die "$SSH_DROPIN 不能是符号链接。"
-  write_managed_file "$SSH_DROPIN" 0644 root root <<EOF
-# Managed by 404notfound/01-bootstrap.sh.
-# Proxy application configuration intentionally does not belong here.
+  local staged_content
+  staged_content=$(mktemp "$TMP_DIR/ssh-hardening.XXXXXXXX")
+  {
+    printf '%s\n' \
+      '# Managed by 404notfound/01-bootstrap.sh.' \
+      '# Proxy application configuration intentionally does not belong here.'
+    if [[ "$KEEP_SSH_22" == true ]]; then
+      printf '%s\n' 'Port 22'
+    fi
+    cat <<EOF
 Port $SSH_PORT
 PermitRootLogin prohibit-password
 AllowUsers root
@@ -504,7 +1078,10 @@ PasswordAuthentication no
 KbdInteractiveAuthentication no
 PermitEmptyPasswords no
 UsePAM yes
+X11Forwarding no
 EOF
+  } >"$staged_content"
+  write_managed_file "$SSH_DROPIN" 0644 root root <"$staged_content"
   if [[ "$LAST_WRITE_CHANGED" == true ]]; then
     record_ssh_change "$SSH_DROPIN"
   fi
@@ -516,6 +1093,11 @@ prepare_ssh_configuration() {
   mkdir -p "$SSH_DROPIN_DIR"
   write_ssh_dropin
   ensure_bootstrap_include_first
+  if [[ -e "$LEGACY_SSH_DROPIN" || -L "$LEGACY_SSH_DROPIN" ]]; then
+    backup_file "$LEGACY_SSH_DROPIN"
+    rm -f -- "$LEGACY_SSH_DROPIN"
+    record_ssh_change "$LEGACY_SSH_DROPIN"
+  fi
   neutralize_ssh_conflicts "$SSH_MAIN_CONFIG"
 
   shopt -s nullglob
@@ -538,15 +1120,28 @@ sshd_value_is() {
 validate_effective_sshd_config() {
   local port
   local port_count=0
+  local found_new_port=false
+  local found_port_22=false
   SSHD_EFFECTIVE=$(sshd -T)
   SSHD_EFFECTIVE_ROOT=$(sshd -T -C user=root,host=localhost,addr=127.0.0.1)
 
   while IFS= read -r port; do
     [[ -n "$port" ]] || continue
     ((port_count += 1))
-    [[ "$port" == "$SSH_PORT" ]] || return 1
+    case "$port" in
+      "$SSH_PORT") found_new_port=true ;;
+      22) found_port_22=true ;;
+      *) return 1 ;;
+    esac
   done < <(awk '$1 == "port" { print $2 }' <<<"$SSHD_EFFECTIVE")
-  (( port_count > 0 )) || return 1
+  [[ "$found_new_port" == true ]] || return 1
+  if [[ "$KEEP_SSH_22" == true ]]; then
+    [[ "$found_port_22" == true ]] || return 1
+    (( port_count == 2 )) || return 1
+  else
+    [[ "$found_port_22" == false ]] || return 1
+    (( port_count == 1 )) || return 1
+  fi
 
   if ! sshd_value_is "$SSHD_EFFECTIVE_ROOT" permitrootlogin prohibit-password &&
     ! sshd_value_is "$SSHD_EFFECTIVE_ROOT" permitrootlogin without-password; then
@@ -560,6 +1155,7 @@ validate_effective_sshd_config() {
   sshd_value_is "$SSHD_EFFECTIVE_ROOT" kbdinteractiveauthentication no || return 1
   sshd_value_is "$SSHD_EFFECTIVE_ROOT" permitemptypasswords no || return 1
   sshd_value_is "$SSHD_EFFECTIVE_ROOT" usepam yes || return 1
+  sshd_value_is "$SSHD_EFFECTIVE_ROOT" x11forwarding no || return 1
 }
 
 rollback_ssh_configuration() {
@@ -652,7 +1248,11 @@ configure_ssh() {
     rollback_ssh_configuration
     die "$SSH_PORT/tcp 未开始监听；未启用或收紧 UFW。"
   fi
-  if is_tcp_port_listening 22; then
+  if [[ "$KEEP_SSH_22" == true ]] && ! is_tcp_port_listening 22; then
+    rollback_ssh_configuration
+    die '已选择保留 22/tcp，但 reload 后该端口未监听；未启用或收紧 UFW。'
+  fi
+  if [[ "$KEEP_SSH_22" == false ]] && is_tcp_port_listening 22; then
     rollback_ssh_configuration
     die '22/tcp 仍在监听；未启用或收紧 UFW。'
   fi
@@ -662,7 +1262,11 @@ configure_ssh() {
   fi
 
   SSH_READY=true
-  log "SSH 已通过 sshd -t、sshd -T 和监听检查：仅目标端口 $SSH_PORT/tcp。"
+  if [[ "$KEEP_SSH_22" == true ]]; then
+    log "SSH 已通过 sshd -t、sshd -T 和监听检查：22/tcp 与 $SSH_PORT/tcp。"
+  else
+    log "SSH 已通过 sshd -t、sshd -T 和监听检查：仅目标端口 $SSH_PORT/tcp。"
+  fi
 }
 
 ensure_ufw_ipv6() {
@@ -690,44 +1294,105 @@ ensure_ufw_ipv6() {
   fi
 }
 
-find_forbidden_ufw_allow_rule() {
-  local status_output
-  status_output=$(ufw status numbered 2>/dev/null || true)
-  awk '
+find_any_ufw_allow_rule() {
+  local target=$1
+  ufw status numbered 2>/dev/null | awk -v target="$target" '
     {
-      lower = tolower($0)
-      if (lower !~ /allow/) {
-        next
+      original = $0
+      sub(/^\[[[:space:]]*[0-9]+\][[:space:]]*/, "", $0)
+      field = 2
+      if ($2 == "(v6)") {
+        field = 3
       }
-      if (lower ~ /(^|[[:space:]])22(\/tcp)?([[:space:]]|$)/ ||
-          lower ~ /(^|[[:space:]])8443(\/tcp)?([[:space:]]|$)/ ||
-          lower ~ /openssh/) {
-        number = $0
+      if ($1 == target && toupper($(field)) == "ALLOW" &&
+          toupper($(field + 1)) == "IN") {
+        number = original
         sub(/^\[[[:space:]]*/, "", number)
         sub(/\].*$/, "", number)
         print number
-        exit
       }
     }
-  ' <<<"$status_output"
+  '
 }
 
-remove_forbidden_ufw_allows() {
+find_unmanaged_8443_rule() {
+  ufw status numbered 2>/dev/null | awk '
+    {
+      original = $0
+      sub(/^\[[[:space:]]*[0-9]+\][[:space:]]*/, "", $0)
+      field = 2
+      if ($2 == "(v6)") {
+        field = 3
+      }
+      if ($1 == "8443/tcp" && toupper($(field)) == "ALLOW" &&
+          toupper($(field + 1)) == "IN" && original !~ /# Cloudflare-8443/) {
+        number = original
+        sub(/^\[[[:space:]]*/, "", number)
+        sub(/\].*$/, "", number)
+        print number
+      }
+    }
+  '
+}
+
+delete_ufw_rule_numbers() {
   local rule_number
   local count=0
-  while rule_number=$(find_forbidden_ufw_allow_rule) && [[ -n "$rule_number" ]]; do
+  while IFS= read -r rule_number; do
+    [[ -n "$rule_number" ]] || continue
     ((count += 1))
-    (( count <= 50 )) || die '清理 UFW 冲突规则超过安全上限。'
+    (( count <= 200 )) || die '清理 UFW 规则超过安全上限。'
     ufw --force delete "$rule_number"
+  done < <(sort -rn)
+}
+
+remove_all_ufw_allows() {
+  local target=$1
+  local rule_number
+  while rule_number=$(find_any_ufw_allow_rule "$target") &&
+    [[ -n "$rule_number" ]]; do
+    printf '%s\n' "$rule_number" | delete_ufw_rule_numbers
   done
+}
+
+remove_unmanaged_8443_allows() {
+  local rule_number
+  while rule_number=$(find_unmanaged_8443_rule) && [[ -n "$rule_number" ]]; do
+    printf '%s\n' "$rule_number" | delete_ufw_rule_numbers
+  done
+}
+
+ufw_has_comment() {
+  local comment=$1
+  ufw status 2>/dev/null | grep -Fq -- "# $comment"
 }
 
 verify_ufw() {
   ufw_is_active || return 1
   ufw_allows_port "$SSH_PORT/tcp" || return 1
-  ufw_allows_port '443/tcp' || return 1
-  ufw_allows_port '443/udp' || return 1
-  [[ -z "$(find_forbidden_ufw_allow_rule)" ]] || return 1
+  if [[ "$KEEP_SSH_22" == true ]]; then
+    ufw_allows_port '22/tcp' || return 1
+  else
+    [[ -z "$(find_any_ufw_allow_rule '22/tcp')" ]] || return 1
+    [[ -z "$(find_any_ufw_allow_rule 'OpenSSH')" ]] || return 1
+  fi
+  if [[ "$OPEN_443_TCP" == true ]]; then
+    ufw_allows_port '443/tcp' || return 1
+  else
+    [[ -z "$(find_any_ufw_allow_rule '443/tcp')" ]] || return 1
+  fi
+  if [[ "$OPEN_443_UDP" == true ]]; then
+    ufw_allows_port '443/udp' || return 1
+  else
+    [[ -z "$(find_any_ufw_allow_rule '443/udp')" ]] || return 1
+  fi
+  if [[ "$ENABLE_CF_8443" == true ]]; then
+    ufw_has_comment 'Cloudflare-8443' || return 1
+    [[ -z "$(find_unmanaged_8443_rule)" ]] || return 1
+  else
+    ! ufw_has_comment 'Cloudflare-8443' || return 1
+    [[ -z "$(find_any_ufw_allow_rule '8443/tcp')" ]] || return 1
+  fi
 }
 
 configure_ufw() {
@@ -738,15 +1403,48 @@ configure_ufw() {
 
   ufw default deny incoming
   ufw default allow outgoing
+  remove_all_ufw_allows 'OpenSSH'
+
+  local old_port
+  local -a old_ports=()
+  IFS=',' read -r -a old_ports <<<"$INITIAL_SSH_PORTS"
+  for old_port in "${old_ports[@]}"; do
+    [[ -n "$old_port" && "$old_port" != "$SSH_PORT" ]] || continue
+    if [[ "$old_port" == 22 && "$KEEP_SSH_22" == true ]]; then
+      continue
+    fi
+    remove_all_ufw_allows "$old_port/tcp"
+  done
+
   ufw allow "$SSH_PORT/tcp"
-  ufw allow 443/tcp
-  ufw allow 443/udp
-  remove_forbidden_ufw_allows
+  if [[ "$KEEP_SSH_22" == true ]]; then
+    ufw allow 22/tcp
+  else
+    remove_all_ufw_allows '22/tcp'
+  fi
+  if [[ "$OPEN_443_TCP" == true ]]; then
+    ufw allow 443/tcp
+  else
+    remove_all_ufw_allows '443/tcp'
+  fi
+  if [[ "$OPEN_443_UDP" == true ]]; then
+    ufw allow 443/udp
+  else
+    remove_all_ufw_allows '443/udp'
+  fi
+
+  remove_unmanaged_8443_allows
   ufw --force enable
+  if [[ "$ENABLE_CF_8443" == true ]]; then
+    bash "$CLOUDFLARE_UFW_SCRIPT"
+  else
+    bash "$CLOUDFLARE_UFW_SCRIPT" --remove
+  fi
 
   verify_ufw || die 'UFW 最终规则验证失败；请保持当前 SSH 会话并人工检查。'
   ufw status verbose
-  log 'UFW 已启用，IPv6 保持开启；22/OpenSSH/8443 不存在允许规则。'
+  ufw status numbered
+  log 'UFW 最终规则已按安装模式验证；8443/tcp 未向全网开放。'
 }
 
 read_sysctl() {
@@ -792,9 +1490,9 @@ configure_bbr() {
   write_managed_file /etc/modules-load.d/bbr.conf 0644 root root <<'EOF'
 tcp_bbr
 EOF
-  write_managed_file /etc/sysctl.d/99-bbr.conf 0644 root root <<'EOF'
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
+write_managed_file /etc/sysctl.d/99-bbr.conf 0644 root root <<'EOF'
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
 EOF
 
   if ! sysctl --system; then
@@ -882,16 +1580,177 @@ smartdns_version_text() {
 }
 
 install_smartdns() {
-  CURRENT_STEP='安装 SmartDNS'
+  CURRENT_STEP='安装并配置 SmartDNS'
   apt_get install -y smartdns
   command -v smartdns >/dev/null 2>&1 || die '安装后找不到 smartdns。'
   [[ -n "$(smartdns_version_text)" ]] || die 'SmartDNS 版本验证失败。'
-  install -d -o root -g root -m 0755 /etc/smartdns
-  systemctl disable --now smartdns.service
-  if systemctl is-active --quiet smartdns.service; then
-    die 'SmartDNS 服务仍在运行。'
+  [[ -s "$SMARTDNS_CONFIG_SOURCE" ]] || die '仓库中的 SmartDNS 配置不存在或为空。'
+
+  local port_53_output
+  port_53_output=$(ss -H -lntup 'sport = :53' 2>/dev/null || true)
+  if grep -Ev 'smartdns|127\.0\.0\.53:53' <<<"$port_53_output" |
+    grep -Eq '(^|[[:space:]])(127\.0\.0\.1|0\.0\.0\.0|\*|\[::\]|\[::1\]):53([[:space:]]|$)'; then
+    die "53 端口已被其他进程占用，拒绝覆盖：$(shorten_line "$port_53_output")"
   fi
-  log "SmartDNS 已安装但未运行：$(smartdns_version_text)"
+
+  smartdns -c "$SMARTDNS_CONFIG_SOURCE" -x >/dev/null 2>&1 ||
+    die '仓库中的 SmartDNS 配置检查失败。'
+
+  local service_user
+  local service_group
+  service_user=$(systemctl show smartdns.service -p User --value 2>/dev/null || true)
+  [[ -n "$service_user" ]] || service_user='root'
+  if id "$service_user" >/dev/null 2>&1; then
+    service_group=$(id -gn "$service_user")
+  else
+    service_user='root'
+    service_group='root'
+  fi
+
+  install -d -o root -g root -m 0755 /etc/smartdns
+  install -d -o "$service_user" -g "$service_group" -m 0750 /var/cache/smartdns
+  backup_file /etc/smartdns/smartdns.conf
+  install -o root -g root -m 0644 "$SMARTDNS_CONFIG_SOURCE" /etc/smartdns/smartdns.conf
+
+  systemctl enable smartdns.service
+  systemctl restart smartdns.service
+  systemctl is-active --quiet smartdns.service || die 'SmartDNS 服务未处于 active 状态。'
+
+  for _ in {1..10}; do
+    if ss -H -lun 'sport = :53' 2>/dev/null | grep -q '127\.0\.0\.1:53' &&
+      ss -H -ltn 'sport = :53' 2>/dev/null | grep -q '127\.0\.0\.1:53'; then
+      break
+    fi
+    sleep 1
+  done
+  ss -H -lun 'sport = :53' 2>/dev/null | grep -q '127\.0\.0\.1:53' ||
+    die 'SmartDNS 未在 127.0.0.1:53/udp 监听。'
+  ss -H -ltn 'sport = :53' 2>/dev/null | grep -q '127\.0\.0\.1:53' ||
+    die 'SmartDNS 未在 127.0.0.1:53/tcp 监听。'
+  dig +time=2 +tries=1 @127.0.0.1 debian.org A >/dev/null 2>&1 ||
+    die 'SmartDNS 本地解析验证失败，系统 DNS 尚未修改。'
+
+  SMARTDNS_READY=true
+  log "SmartDNS 已安装并验证：$(smartdns_version_text)，127.0.0.1:53/udp+tcp。"
+}
+
+restore_resolv_conf() {
+  rm -f -- /etc/resolv.conf
+  restore_file /etc/resolv.conf
+}
+
+configure_system_dns() {
+  CURRENT_STEP='切换系统唯一 DNS'
+  [[ "$SMARTDNS_READY" == true ]] || die 'SmartDNS 未通过验证，拒绝修改 /etc/resolv.conf。'
+  [[ ! -d /etc/resolv.conf ]] || die '/etc/resolv.conf 不能是目录。'
+
+  local staged_resolv
+  staged_resolv=$(mktemp "$TMP_DIR/resolv.conf.XXXXXXXX")
+  cat >"$staged_resolv" <<'EOF'
+nameserver 127.0.0.1
+options timeout:2
+options attempts:2
+EOF
+
+  backup_file /etc/resolv.conf
+  if [[ -L /etc/resolv.conf ]]; then
+    log "检测到 /etc/resolv.conf 软链接：$(readlink /etc/resolv.conf)；已备份后替换为受管普通文件。"
+  fi
+  rm -f -- /etc/resolv.conf
+  install -o root -g root -m 0644 "$staged_resolv" /etc/resolv.conf
+
+  if ! timeout 6 getent ahosts debian.org >/dev/null 2>&1; then
+    warn '系统默认 DNS 测试失败，正在恢复原来的 /etc/resolv.conf。'
+    restore_resolv_conf || true
+    die '切换到 SmartDNS 后系统解析失败，原 resolv.conf 已尝试恢复。'
+  fi
+  [[ ! -L /etc/resolv.conf ]] || die '最终 /etc/resolv.conf 不应是软链接。'
+  [[ $(grep -Ec '^nameserver[[:space:]]+' /etc/resolv.conf) -eq 1 ]] ||
+    die '/etc/resolv.conf 必须只包含一个 nameserver。'
+  grep -Eq '^nameserver[[:space:]]+127\.0\.0\.1$' /etc/resolv.conf ||
+    die '/etc/resolv.conf 未指向 127.0.0.1。'
+  DNS_READY=true
+  log '系统 DNS 已验证仅使用 127.0.0.1；未配置任何备用 nameserver。'
+}
+
+install_reality_checker_impl() {
+  local asset_name
+  local asset_url
+  local work_dir
+  local archive
+  local extract_dir
+  case "$CPU_ARCH" in
+    amd64) asset_name='reality-checker-linux-amd64.zip' ;;
+    arm64) asset_name='reality-checker-linux-arm64.zip' ;;
+    *) return 2 ;;
+  esac
+
+  work_dir=$(mktemp -d "$TMP_DIR/reality-checker.XXXXXXXX") || return 1
+  archive="$work_dir/$asset_name"
+  extract_dir="$work_dir/extracted"
+  asset_url="https://github.com/$REALITY_CHECKER_REPOSITORY/releases/latest/download/$asset_name"
+
+  curl --fail --silent --show-error --location \
+    --connect-timeout 5 --max-time 120 --retry 3 --retry-delay 1 \
+    "$asset_url" --output "$archive" || return 1
+  [[ -s "$archive" ]] || return 1
+  mkdir -p "$extract_dir" || return 1
+  unzip -q "$archive" -d "$extract_dir" || return 1
+
+  local candidate=''
+  local candidate_file
+  local file_description
+  while IFS= read -r -d '' candidate_file; do
+    file_description=$(file -b "$candidate_file" 2>/dev/null || true)
+    case "$CPU_ARCH:$file_description" in
+      amd64:*ELF*x86-64*|arm64:*ELF*aarch64*) candidate=$candidate_file; break ;;
+    esac
+  done < <(find "$extract_dir" -type f -name 'reality-checker' -print0)
+  [[ -n "$candidate" ]] || return 2
+
+  backup_file /usr/local/bin/reality-checker || return 1
+  if ! install -o root -g root -m 0755 "$candidate" /usr/local/bin/reality-checker; then
+    restore_file /usr/local/bin/reality-checker || true
+    return 1
+  fi
+
+  if ! verify_reality_checker_command version &&
+    ! verify_reality_checker_command --help; then
+    restore_file /usr/local/bin/reality-checker || true
+    return 1
+  fi
+  log "RealityChecker 已从 $REALITY_CHECKER_REPOSITORY 官方 Release 安装并验证：$asset_name"
+}
+
+verify_reality_checker_command() {
+  local output
+  local exit_code
+  if output=$(timeout 10 /usr/local/bin/reality-checker "$@" 2>&1); then
+    exit_code=0
+  else
+    exit_code=$?
+  fi
+  [[ -n "$output" && "$exit_code" != 124 && "$exit_code" != 126 &&
+    "$exit_code" != 127 && "$exit_code" -lt 128 ]]
+}
+
+install_reality_checker() {
+  CURRENT_STEP='安装 RealityChecker'
+  local exit_code
+  REALITY_CHECKER_STATE='安装失败'
+  set +e
+  install_reality_checker_impl
+  exit_code=$?
+  set -e
+  if (( exit_code == 0 )); then
+    REALITY_CHECKER_STATE='已安装'
+  else
+    if (( exit_code == 2 )); then
+      warn "RealityChecker 不支持当前架构或压缩包中缺少匹配 $CPU_ARCH 的 reality-checker；未安装错误架构文件。"
+    else
+      warn 'RealityChecker 下载、解压或执行验证失败；其余初始化继续。'
+    fi
+  fi
 }
 
 service_state() {
@@ -903,57 +1762,120 @@ service_state() {
 
 print_final_report() {
   CURRENT_STEP='输出最终报告'
-  local reboot_required='否'
-  local ssh_listeners
-  local system_time
+  local reboot_required='No'
+  local update_state='已完成 full-upgrade'
+  local ssh_22_state='已关闭'
+  local tcp_443_state='未开放'
+  local udp_443_state='未开放'
+  local port_8443_state='未开放'
+  local sing_enabled
+  local sing_active
   [[ -e /var/run/reboot-required ]] &&
-    reboot_required='是（建议在新 SSH 登录验证后手动重启）'
-  system_time=$(date --iso-8601=seconds)
-  ssh_listeners=$(ss -H -ltnp 2>/dev/null | awk '/sshd/ { print }' || true)
-  [[ -n "$ssh_listeners" ]] || ssh_listeners='未能从 ss 输出识别 sshd 进程'
+    reboot_required='Yes'
+  [[ "$SKIP_UPGRADE" == true ]] && update_state='已跳过 full-upgrade（已执行 apt-get update）'
+  [[ "$KEEP_SSH_22" == true ]] && ssh_22_state='已保留'
+  [[ "$OPEN_443_TCP" == true ]] && tcp_443_state='已开放'
+  [[ "$OPEN_443_UDP" == true ]] && udp_443_state='已开放'
+  [[ "$ENABLE_CF_8443" == true ]] && port_8443_state='Cloudflare-only'
+  sing_enabled=$(systemctl is-enabled sing-box.service 2>/dev/null || true)
+  sing_active=$(service_state sing-box.service)
 
   printf '\n'
-  printf '%s\n' '================ 初始化检查摘要 ================'
-  printf '%-24s %s\n' 'Debian 版本:' "$DEBIAN_VERSION"
-  printf '%-24s %s\n' 'CPU 架构:' "$CPU_ARCH"
-  printf '%-24s %s\n' '当前内核:' "$(uname -r)"
-  printf '%-24s %s\n' '系统时间:' "$system_time"
-  printf '%-24s %s\n' 'chrony 状态:' "$(service_state chrony.service)"
-  printf '%-24s %s\n' 'SSH 最终端口:' "$SSH_PORT/tcp"
-  printf '%-24s %s\n' 'SSH 认证策略:' \
-    '仅 root + publickey；密码、键盘交互和空密码均禁用'
-  printf '%-24s\n%s\n' 'SSH 当前监听:' "$ssh_listeners"
-  printf '%-24s %s\n' 'TCP 拥塞算法:' \
-    "$(read_sysctl net.ipv4.tcp_congestion_control)"
-  printf '%-24s %s\n' '默认 qdisc:' "$(read_sysctl net.core.default_qdisc)"
-  printf '%-24s %s\n' 'sing-box 版本:' "$(sing_box_version_text)"
-  printf '%-24s %s\n' 'sing-box 服务:' "$(service_state sing-box.service)"
-  printf '%-24s %s\n' 'SmartDNS 版本:' "$(smartdns_version_text)"
-  printf '%-24s %s\n' 'SmartDNS 服务:' "$(service_state smartdns.service)"
-  printf '%-24s %s\n' '需要重启:' "$reboot_required"
-  printf '%-24s %s\n' '本轮备份目录:' "$BACKUP_DIR"
-  printf '%s\n' 'UFW 状态与规则：'
-  ufw status verbose || true
-  printf '%s\n' '=================================================='
-  printf '%s\n' '代理节点配置尚未部署。'
-  printf '%s\n' '请保持当前 SSH 会话，并从另一个终端用新端口和对应私钥验证登录。'
+  health_box_line
+  color_text '38;5;208' '###                 VPS 初始化完成                       ###'
+  printf '\n'
+  health_box_line
+  printf '%-20s %s\n' '安装模式' "$INSTALL_MODE"
+  printf '%-20s Debian %s\n' '系统版本' "$DEBIAN_VERSION"
+  printf '%-20s %s\n' '系统更新' "$update_state"
+  printf '%-20s %s\n' '基础工具' '已安装并验证'
+  printf '%-20s %s\n' 'chrony' "$(service_state chrony.service)"
+  printf '%-20s %s / %s\n' 'BBR/qdisc' \
+    "$(read_sysctl net.ipv4.tcp_congestion_control)" "$(read_sysctl net.core.default_qdisc)"
+  printf '%-20s %s/tcp\n' 'SSH 端口' "$SSH_PORT"
+  printf '%-20s %s\n' 'SSH 22' "$ssh_22_state"
+  printf '%-20s %s\n' 'root 密码登录' '已禁用（已由 sshd -T 验证）'
+  printf '%-20s %s\n' '443/tcp' "$tcp_443_state"
+  printf '%-20s %s\n' '443/udp' "$udp_443_state"
+  printf '%-20s %s\n' '8443/tcp' "$port_8443_state"
+  printf '%-20s %s\n' 'UFW' "$(ufw status | awk -F: '/^Status:/ { gsub(/^[[:space:]]+/, "", $2); print $2 }')"
+  printf '%-20s installed，%s，%s\n' 'sing-box' "$sing_enabled" "$sing_active"
+  printf '%-20s %s，127.0.0.1:53/udp+tcp\n' 'SmartDNS' "$(service_state smartdns.service)"
+  if [[ "$DNS_READY" == true ]]; then
+    printf '%-20s %s\n' '系统 DNS' '仅 127.0.0.1（已验证）'
+  else
+    printf '%-20s %s\n' '系统 DNS' '未通过验证'
+  fi
+  printf '%-20s %s\n' 'RealityChecker' "$REALITY_CHECKER_STATE"
+  printf '%-20s %s\n' '备份目录' "$BACKUP_DIR"
+  printf '%-20s %s\n' '是否需要重启' "$reboot_required"
+  health_box_line
+  printf '未执行外部 SSH 登录确认；请保持当前会话并自行验证新端口。\n'
+}
+
+custom_phase_one() {
+  if ask_yes_no '是否执行 apt full-upgrade？' true; then
+    SKIP_UPGRADE=false
+  else
+    SKIP_UPGRADE=true
+  fi
+  update_system
+  install_base_packages
+
+  local choice
+  while true; do
+    printf '\n基础工具已经安装完成。\n1. 继续完整初始化\n2. 退出，用于测试 IP、线路和基础环境\n' >/dev/tty
+    read_tty '请选择 [1-2]: ' choice
+    case "$choice" in
+      1) return 0 ;;
+      2)
+        printf '\n已在基础工具阶段停止：软件包保留；未修改 SSH、UFW、BBR、SmartDNS 或系统 DNS，也未安装 sing-box/RealityChecker。\n'
+        exit 0
+        ;;
+      *) printf '无效选择。\n' >/dev/tty ;;
+    esac
+  done
+}
+
+run_remaining_initialization() {
+  configure_chrony
+  configure_bbr
+  install_sing_box
+  install_smartdns
+  configure_system_dns
+  install_reality_checker
+  configure_ssh
+  configure_ufw
+  print_final_report
 }
 
 main() {
   parse_args "$@"
+  initialize_colors
+  run_health_check
+  [[ -r /dev/tty && -w /dev/tty ]] ||
+    die '体检已完成，但当前没有交互式 /dev/tty；未执行任何安装或配置修改。'
+  select_install_mode
   preflight
-  collect_public_key
-  update_system
-  install_base_packages
-  validate_public_key
-  configure_chrony
-  install_authorized_key
-  configure_ssh
-  configure_ufw
-  configure_bbr
-  install_sing_box
-  install_smartdns
-  print_final_report
+
+  if [[ "$INSTALL_MODE" == '快速安装' ]]; then
+    configure_quick_choices
+    ssh_port_has_conflict "$SSH_PORT" &&
+      die "$SSH_PORT/tcp 已被非 sshd 进程监听，无法执行快速安装。"
+    collect_public_key
+    validate_public_key
+    install_authorized_key
+    update_system
+    install_base_packages
+  else
+    custom_phase_one
+    collect_public_key
+    validate_public_key
+    install_authorized_key
+    configure_custom_network_choices
+  fi
+
+  run_remaining_initialization
 }
 
 main "$@"

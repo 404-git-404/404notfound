@@ -18,6 +18,10 @@ jobs:
         run: |
           bash -n 01-bootstrap.sh
           bash -n request-cloudflare-certificate.sh
+          bash -n scripts/update-cloudflare-ufw.sh
+
+      - name: Check SmartDNS configuration artifact
+        run: test -s configs/smartdns.conf
 
       - name: Install ShellCheck
         run: |
@@ -28,3 +32,4 @@ jobs:
         run: |
           shellcheck 01-bootstrap.sh
           shellcheck request-cloudflare-certificate.sh
+          shellcheck scripts/update-cloudflare-ufw.sh
