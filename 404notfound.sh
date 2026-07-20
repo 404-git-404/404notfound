@@ -9,15 +9,12 @@ export DEBIAN_FRONTEND=noninteractive
 export LC_ALL=C
 
 readonly DEFAULT_SSH_PORT='53651'
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
-readonly SCRIPT_DIR
 readonly SSH_MAIN_CONFIG='/etc/ssh/sshd_config'
 readonly SSH_DROPIN_DIR='/etc/ssh/sshd_config.d'
 readonly SSH_DROPIN="$SSH_DROPIN_DIR/00-hardening.conf"
 readonly LEGACY_SSH_DROPIN="$SSH_DROPIN_DIR/00-vps-bootstrap.conf"
 readonly AUTHORIZED_KEYS='/root/.ssh/authorized_keys'
-readonly SMARTDNS_CONFIG_SOURCE="$SCRIPT_DIR/configs/smartdns.conf"
-readonly CLOUDFLARE_UFW_SCRIPT="$SCRIPT_DIR/scripts/update-cloudflare-ufw.sh"
+readonly CLOUDFLARE_UFW_TOOL='/usr/local/sbin/update-cloudflare-ufw'
 readonly SAGER_KEY_FINGERPRINT='2C317FBD5D886B4E89BAE8DA6D9152172A2B2F0C'
 readonly DEFAULT_REALITY_CHECKER_REPOSITORY='V2RaySSR/RealityChecker'
 
@@ -67,8 +64,8 @@ readonly -a BASE_PACKAGES=(
 usage() {
   cat <<'EOF'
 用法：
-  bash 01-bootstrap.sh
-  bash 01-bootstrap.sh [预设选项]
+  bash 404notfound.sh
+  bash 404notfound.sh [预设选项]
 
 脚本首先执行完全只读的 VPS 环境体检，然后显示：
   1. 快速安装
@@ -626,11 +623,6 @@ preflight() {
   command -v apt-get >/dev/null 2>&1 || die '缺少 apt-get。'
   command -v mktemp >/dev/null 2>&1 || die '缺少 mktemp。'
   command -v base64 >/dev/null 2>&1 || die '缺少 base64。'
-  [[ -s "$SMARTDNS_CONFIG_SOURCE" ]] ||
-    die "缺少或无法读取 SmartDNS 配置：$SMARTDNS_CONFIG_SOURCE"
-  [[ -s "$CLOUDFLARE_UFW_SCRIPT" ]] ||
-    die "缺少 Cloudflare UFW 更新脚本：$CLOUDFLARE_UFW_SCRIPT"
-
   TMP_DIR=$(mktemp -d -t 404notfound-bootstrap.XXXXXXXX)
   BACKUP_DIR="/var/backups/404notfound-bootstrap/$(date -u '+%Y%m%dT%H%M%SZ')-$$"
   log "环境预检通过：Debian $DEBIAN_VERSION，$CPU_ARCH。"
@@ -1063,7 +1055,7 @@ write_ssh_dropin() {
   staged_content=$(mktemp "$TMP_DIR/ssh-hardening.XXXXXXXX")
   {
     printf '%s\n' \
-      '# Managed by 404notfound/01-bootstrap.sh.' \
+      '# Managed by 404notfound/404notfound.sh.' \
       '# Proxy application configuration intentionally does not belong here.'
     if [[ "$KEEP_SSH_22" == true ]]; then
       printf '%s\n' 'Port 22'
@@ -1395,6 +1387,212 @@ verify_ufw() {
   fi
 }
 
+install_cloudflare_ufw_tool() {
+  CURRENT_STEP='安装 Cloudflare 8443 UFW 更新工具'
+  write_managed_file "$CLOUDFLARE_UFW_TOOL" 0755 root root <<'CLOUDFLARE_UFW_TOOL'
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+umask 077
+
+export PATH='/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+export LC_ALL=C
+
+readonly PORT='8443'
+readonly COMMENT='Cloudflare-8443'
+readonly LOCK_FILE='/run/lock/404notfound-cloudflare-ufw.lock'
+
+TMP_DIR=''
+BACKUP_DIR=''
+
+cleanup() {
+  local exit_code=$?
+  if [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]]; then
+    rm -rf -- "$TMP_DIR"
+  fi
+  exit "$exit_code"
+}
+
+die() {
+  printf '[ERROR] %s\n' "$*" >&2
+  exit 1
+}
+
+trap cleanup EXIT
+trap 'printf "[ERROR] Cloudflare UFW 更新在第 %s 行失败。\n" "$LINENO" >&2' ERR
+trap 'printf "[WARN] 收到中断信号，停止更新。\n" >&2; exit 130' INT TERM
+
+(( EUID == 0 )) || die '必须以 root 身份运行。'
+command -v curl >/dev/null 2>&1 || die '缺少 curl。'
+command -v flock >/dev/null 2>&1 || die '缺少 flock。'
+command -v python3 >/dev/null 2>&1 || die '缺少 python3，无法严格校验 CIDR。'
+command -v ufw >/dev/null 2>&1 || die '缺少 ufw。'
+
+mkdir -p -- "$(dirname "$LOCK_FILE")"
+exec 9>"$LOCK_FILE"
+flock -n 9 || die '已有另一个 Cloudflare UFW 更新正在运行。'
+
+TMP_DIR=$(mktemp -d -t cloudflare-ufw.XXXXXXXX)
+
+ufw status | grep -q '^Status: active$' ||
+  die 'UFW 必须处于 active 状态，才能可靠更新并核对 Cloudflare 规则。'
+
+BACKUP_DIR="/var/backups/404notfound-cloudflare-ufw/$(date -u '+%Y%m%dT%H%M%SZ')-$$"
+install -d -o root -g root -m 0700 "$BACKUP_DIR/etc/ufw"
+for ufw_file in /etc/ufw/user.rules /etc/ufw/user6.rules; do
+  if [[ -e "$ufw_file" ]]; then
+    cp -a -- "$ufw_file" "$BACKUP_DIR$ufw_file"
+  fi
+done
+
+ufw_ipv6_enabled() {
+  [[ -r /etc/default/ufw ]] && grep -Eq '^IPV6=yes([[:space:]]*)$' /etc/default/ufw
+}
+
+download_cidr_list() {
+  local url=$1
+  local destination=$2
+  curl --fail --silent --show-error --location \
+    --connect-timeout 5 --max-time 30 --retry 3 --retry-delay 1 \
+    "$url" --output "$destination"
+  [[ -s "$destination" ]] || die "下载结果为空：$url"
+}
+
+validate_cidr_file() {
+  local family=$1
+  local path=$2
+  python3 - "$family" "$path" <<'PY'
+import ipaddress
+import pathlib
+import sys
+
+family = int(sys.argv[1])
+path = pathlib.Path(sys.argv[2])
+lines = [line.strip() for line in path.read_text(encoding="ascii").splitlines() if line.strip()]
+if not lines:
+    raise SystemExit("CIDR list is empty")
+for line in lines:
+    network = ipaddress.ip_network(line, strict=True)
+    if network.version != family:
+        raise SystemExit(f"unexpected IPv{network.version} CIDR: {line}")
+PY
+}
+
+managed_rule_numbers() {
+  ufw status numbered | awk -v comment="$COMMENT" '
+    index($0, "# " comment) {
+      number = $0
+      sub(/^\[[[:space:]]*/, "", number)
+      sub(/\].*$/, "", number)
+      print number
+    }
+  '
+}
+
+global_8443_rule_numbers() {
+  ufw status numbered | awk -v port="$PORT/tcp" '
+    {
+      original = $0
+      sub(/^\[[[:space:]]*[0-9]+\][[:space:]]*/, "", $0)
+      field = 2
+      if ($2 == "(v6)") {
+        field = 3
+      }
+      if ($1 == port && toupper($(field)) == "ALLOW" &&
+          toupper($(field + 1)) == "IN" && $(field + 2) == "Anywhere") {
+        number = original
+        sub(/^\[[[:space:]]*/, "", number)
+        sub(/\].*$/, "", number)
+        print number
+      }
+    }
+  '
+}
+
+delete_rule_numbers() {
+  local number
+  while IFS= read -r number; do
+    [[ -n "$number" ]] || continue
+    ufw --force delete "$number"
+  done < <(sort -rn)
+}
+
+remove_managed_rules() {
+  managed_rule_numbers | delete_rule_numbers
+}
+
+if [[ "${1:-}" == '--remove' ]]; then
+  remove_managed_rules
+  global_8443_rule_numbers | delete_rule_numbers
+  (( $(managed_rule_numbers | wc -l) == 0 )) || die 'Cloudflare-8443 规则未完全删除。'
+  printf 'Cloudflare 8443 规则已删除。备份：%s\n' "$BACKUP_DIR"
+  exit 0
+fi
+(( $# == 0 )) || die '唯一支持的参数是 --remove。'
+
+download_cidr_list 'https://www.cloudflare.com/ips-v4' "$TMP_DIR/v4"
+download_cidr_list 'https://www.cloudflare.com/ips-v6' "$TMP_DIR/v6"
+validate_cidr_file 4 "$TMP_DIR/v4"
+validate_cidr_file 6 "$TMP_DIR/v6"
+
+awk 'NF { print }' "$TMP_DIR/v4" >"$TMP_DIR/desired"
+if ufw_ipv6_enabled; then
+  awk 'NF { print }' "$TMP_DIR/v6" >>"$TMP_DIR/desired"
+fi
+
+# Add the complete new set first. UFW ignores exact duplicates, so the old
+# allow-list remains effective until every new source has been prepared.
+while IFS= read -r cidr; do
+  [[ -n "$cidr" ]] || continue
+  ufw allow proto tcp from "$cidr" to any port "$PORT" comment "$COMMENT"
+done <"$TMP_DIR/desired"
+
+# Remove stale and duplicate managed rules only after the new set exists.
+ufw status numbered | awk -v comment="$COMMENT" -v desired="$TMP_DIR/desired" '
+  BEGIN {
+    while ((getline line < desired) > 0) {
+      wanted[line] = 1
+    }
+    close(desired)
+  }
+  index($0, "# " comment) {
+    original = $0
+    sub(/^\[[[:space:]]*[0-9]+\][[:space:]]*/, "", $0)
+    field = 2
+    if ($2 == "(v6)") {
+      field = 3
+    }
+    source = $(field + 2)
+    number = original
+    sub(/^\[[[:space:]]*/, "", number)
+    sub(/\].*$/, "", number)
+    if (!wanted[source] || seen[source]++) {
+      print number
+    }
+  }
+' | delete_rule_numbers
+
+# A global allow would defeat the source allow-list; remove only exact
+# Anywhere rules for this port and leave unrelated restricted rules alone.
+global_8443_rule_numbers | delete_rule_numbers
+
+expected=$(awk 'NF { count++ } END { print count + 0 }' "$TMP_DIR/desired")
+actual=$(managed_rule_numbers | wc -l)
+
+printf '\nCloudflare 规则：%s/%s\n\n' "$actual" "$expected"
+ufw status numbered
+(( actual == expected )) || die 'Cloudflare 规则实际数量与预期不一致。'
+printf '\n更新完成，规则数量正常，8443/tcp 未向全网开放。\n'
+printf 'UFW 规则备份：%s\n' "$BACKUP_DIR"
+CLOUDFLARE_UFW_TOOL
+
+  bash -n "$CLOUDFLARE_UFW_TOOL" || die '内嵌 Cloudflare UFW 工具语法检查失败。'
+  [[ $(stat -c '%U:%G:%a' "$CLOUDFLARE_UFW_TOOL") == 'root:root:755' ]] ||
+    die 'Cloudflare UFW 工具所有者或权限验证失败。'
+  log "Cloudflare UFW 更新工具已安装并验证：$CLOUDFLARE_UFW_TOOL"
+}
+
 configure_ufw() {
   CURRENT_STEP='配置 UFW'
   [[ "$SSH_READY" == true ]] || die 'SSH 安全门禁未通过，拒绝配置 UFW。'
@@ -1436,9 +1634,9 @@ configure_ufw() {
   remove_unmanaged_8443_allows
   ufw --force enable
   if [[ "$ENABLE_CF_8443" == true ]]; then
-    bash "$CLOUDFLARE_UFW_SCRIPT"
+    "$CLOUDFLARE_UFW_TOOL"
   else
-    bash "$CLOUDFLARE_UFW_SCRIPT" --remove
+    "$CLOUDFLARE_UFW_TOOL" --remove
   fi
 
   verify_ufw || die 'UFW 最终规则验证失败；请保持当前 SSH 会话并人工检查。'
@@ -1584,7 +1782,35 @@ install_smartdns() {
   apt_get install -y smartdns
   command -v smartdns >/dev/null 2>&1 || die '安装后找不到 smartdns。'
   [[ -n "$(smartdns_version_text)" ]] || die 'SmartDNS 版本验证失败。'
-  [[ -s "$SMARTDNS_CONFIG_SOURCE" ]] || die '仓库中的 SmartDNS 配置不存在或为空。'
+
+  local staged_config
+  staged_config=$(mktemp "$TMP_DIR/smartdns.conf.XXXXXXXX")
+  cat >"$staged_config" <<'SMARTDNS_CONFIG'
+# Listen only on the local loopback interface, over both UDP and TCP.
+bind 127.0.0.1:53
+bind-tcp 127.0.0.1:53
+
+# Persistent cache and stale-answer handling.
+cache-persist yes
+cache-file /var/cache/smartdns/smartdns.cache
+cache-checkpoint-time 86400
+serve-expired yes
+serve-expired-ttl 259200
+serve-expired-reply-ttl 3
+serve-expired-prefetch-time 21600
+prefetch-domain yes
+
+# Prefer the first upstream that passes the configured speed checks.
+speed-check-mode tcp:443,ping
+response-mode first-ping
+
+# Unified upstream set. The operating system itself has no fallback resolver.
+server 1.1.1.1
+server 1.0.0.1
+server 8.8.8.8
+server 8.8.4.4
+server 9.9.9.9
+SMARTDNS_CONFIG
 
   local port_53_output
   port_53_output=$(ss -H -lntup 'sport = :53' 2>/dev/null || true)
@@ -1593,8 +1819,8 @@ install_smartdns() {
     die "53 端口已被其他进程占用，拒绝覆盖：$(shorten_line "$port_53_output")"
   fi
 
-  smartdns -c "$SMARTDNS_CONFIG_SOURCE" -x >/dev/null 2>&1 ||
-    die '仓库中的 SmartDNS 配置检查失败。'
+  smartdns -c "$staged_config" -x >/dev/null 2>&1 ||
+    die '内嵌 SmartDNS 配置检查失败。'
 
   local service_user
   local service_group
@@ -1609,8 +1835,7 @@ install_smartdns() {
 
   install -d -o root -g root -m 0755 /etc/smartdns
   install -d -o "$service_user" -g "$service_group" -m 0750 /var/cache/smartdns
-  backup_file /etc/smartdns/smartdns.conf
-  install -o root -g root -m 0644 "$SMARTDNS_CONFIG_SOURCE" /etc/smartdns/smartdns.conf
+  write_managed_file /etc/smartdns/smartdns.conf 0644 root root <"$staged_config"
 
   systemctl enable smartdns.service
   systemctl restart smartdns.service
@@ -1799,6 +2024,7 @@ print_final_report() {
   printf '%-20s %s\n' '443/udp' "$udp_443_state"
   printf '%-20s %s\n' '8443/tcp' "$port_8443_state"
   printf '%-20s %s\n' 'UFW' "$(ufw status | awk -F: '/^Status:/ { gsub(/^[[:space:]]+/, "", $2); print $2 }')"
+  printf '%-20s %s\n' 'Cloudflare UFW 工具' "$CLOUDFLARE_UFW_TOOL"
   printf '%-20s installed，%s，%s\n' 'sing-box' "$sing_enabled" "$sing_active"
   printf '%-20s %s，127.0.0.1:53/udp+tcp\n' 'SmartDNS' "$(service_state smartdns.service)"
   if [[ "$DNS_READY" == true ]]; then
@@ -1829,7 +2055,7 @@ custom_phase_one() {
     case "$choice" in
       1) return 0 ;;
       2)
-        printf '\n已在基础工具阶段停止：软件包保留；未修改 SSH、UFW、BBR、SmartDNS 或系统 DNS，也未安装 sing-box/RealityChecker。\n'
+        printf '\n已在基础工具阶段停止：软件包保留；未修改 SSH、UFW、BBR、SmartDNS 或系统 DNS，也未安装 Cloudflare UFW 工具、sing-box 或 RealityChecker。\n'
         exit 0
         ;;
       *) printf '无效选择。\n' >/dev/tty ;;
@@ -1838,6 +2064,7 @@ custom_phase_one() {
 }
 
 run_remaining_initialization() {
+  install_cloudflare_ufw_tool
   configure_chrony
   configure_bbr
   install_sing_box

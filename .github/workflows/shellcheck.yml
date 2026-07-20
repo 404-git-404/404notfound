@@ -16,12 +16,25 @@ jobs:
 
       - name: Check Bash syntax
         run: |
-          bash -n 01-bootstrap.sh
+          bash -n 404notfound.sh
           bash -n request-cloudflare-certificate.sh
-          bash -n scripts/update-cloudflare-ufw.sh
 
-      - name: Check SmartDNS configuration artifact
-        run: test -s configs/smartdns.conf
+      - name: Extract and check embedded Cloudflare tool
+        run: |
+          awk '
+            index($0, "<<") && index($0, "CLOUDFLARE_UFW_TOOL") { capture = 1; next }
+            capture && $0 == "CLOUDFLARE_UFW_TOOL" { exit }
+            capture { print }
+          ' 404notfound.sh > /tmp/update-cloudflare-ufw
+          test -s /tmp/update-cloudflare-ufw
+          bash -n /tmp/update-cloudflare-ufw
+
+      - name: Check embedded SmartDNS configuration
+        run: |
+          grep -Fqx 'bind 127.0.0.1:53' 404notfound.sh
+          grep -Fqx 'bind-tcp 127.0.0.1:53' 404notfound.sh
+          grep -Fqx 'speed-check-mode tcp:443,ping' 404notfound.sh
+          grep -Fqx 'response-mode first-ping' 404notfound.sh
 
       - name: Install ShellCheck
         run: |
@@ -30,6 +43,6 @@ jobs:
 
       - name: Run ShellCheck
         run: |
-          shellcheck 01-bootstrap.sh
+          shellcheck 404notfound.sh
           shellcheck request-cloudflare-certificate.sh
-          shellcheck scripts/update-cloudflare-ufw.sh
+          shellcheck /tmp/update-cloudflare-ufw
