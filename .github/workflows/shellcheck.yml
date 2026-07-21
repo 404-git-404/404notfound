@@ -31,10 +31,20 @@ jobs:
 
       - name: Check embedded SmartDNS configuration
         run: |
+          test ! -e configs/smartdns.conf
           grep -Fqx 'bind 127.0.0.1:53' 404notfound.sh
           grep -Fqx 'bind-tcp 127.0.0.1:53' 404notfound.sh
+          grep -Fqx 'ca-file /etc/ssl/certs/ca-certificates.crt' 404notfound.sh
           grep -Fqx 'speed-check-mode tcp:443,ping' 404notfound.sh
           grep -Fqx 'response-mode first-ping' 404notfound.sh
+          grep -Fqx 'server-https https://1.1.1.1/dns-query -host-name cloudflare-dns.com -tls-host-verify cloudflare-dns.com -http-host cloudflare-dns.com' 404notfound.sh
+          grep -Fqx 'server-https https://8.8.8.8/dns-query -host-name dns.google -tls-host-verify dns.google -http-host dns.google' 404notfound.sh
+          grep -Fqx 'server-https https://9.9.9.9/dns-query -host-name dns.quad9.net -tls-host-verify dns.quad9.net -http-host dns.quad9.net' 404notfound.sh
+          test "$(grep -c '^server-https ' 404notfound.sh)" -eq 3
+          ! grep -Eq '^server[[:space:]]+[0-9]' 404notfound.sh
+          grep -Fq 'dig +time=5 +tries=1 +noall +answer' 404notfound.sh
+          grep -Fq 'NF >= 5 && $3 == "IN" && $4 == "A"' 404notfound.sh
+          grep -Fq 'journalctl -u smartdns.service -n 50 --no-pager' 404notfound.sh
 
       - name: Check installer regressions
         run: |

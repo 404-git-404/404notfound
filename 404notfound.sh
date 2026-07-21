@@ -1930,11 +1930,27 @@ smartdns_version_text() {
   printf '%s' "$output"
 }
 
+print_smartdns_recent_journal() {
+  warn 'SmartDNS 健康检查失败；以下是 smartdns.service 最近 50 行日志：'
+  journalctl -u smartdns.service -n 50 --no-pager >&2 ||
+    warn '无法读取 smartdns.service journal。'
+}
+
+smartdns_health_fail() {
+  local reason=$1
+  print_smartdns_recent_journal
+  die "$reason"
+}
+
 install_smartdns() {
   CURRENT_STEP='安装并配置 SmartDNS'
   local smartdns_version
-  apt_get install -y smartdns
+  local dig_output=''
+  apt_get install -y ca-certificates dnsutils smartdns
   command -v smartdns >/dev/null 2>&1 || die '安装后找不到 smartdns。'
+  command -v dig >/dev/null 2>&1 || die '安装 dnsutils 后仍找不到 dig。'
+  [[ -r /etc/ssl/certs/ca-certificates.crt && -s /etc/ssl/certs/ca-certificates.crt ]] ||
+    die '系统 CA 文件不可读或为空：/etc/ssl/certs/ca-certificates.crt。'
   smartdns_version=$(smartdns_version_text) || die 'SmartDNS 版本验证失败。'
 
   local staged_config
@@ -1958,12 +1974,13 @@ prefetch-domain yes
 speed-check-mode tcp:443,ping
 response-mode first-ping
 
-# Unified upstream set. The operating system itself has no fallback resolver.
-server 1.1.1.1
-server 1.0.0.1
-server 8.8.8.8
-server 8.8.4.4
-server 9.9.9.9
+# Validate DoH certificates with Debian's system CA bundle.
+ca-file /etc/ssl/certs/ca-certificates.crt
+
+# DoH-only upstreams. There is intentionally no plaintext UDP fallback.
+server-https https://1.1.1.1/dns-query -host-name cloudflare-dns.com -tls-host-verify cloudflare-dns.com -http-host cloudflare-dns.com
+server-https https://8.8.8.8/dns-query -host-name dns.google -tls-host-verify dns.google -http-host dns.google
+server-https https://9.9.9.9/dns-query -host-name dns.quad9.net -tls-host-verify dns.quad9.net -http-host dns.quad9.net
 SMARTDNS_CONFIG
 
   local port_53_output
@@ -1991,9 +2008,12 @@ SMARTDNS_CONFIG
   install -d -o "$service_user" -g "$service_group" -m 0750 /var/cache/smartdns
   write_managed_file /etc/smartdns/smartdns.conf 0644 root root <"$staged_config"
 
-  systemctl enable smartdns.service
-  systemctl restart smartdns.service
-  systemctl is-active --quiet smartdns.service || die 'SmartDNS 服务未处于 active 状态。'
+  systemctl enable smartdns.service ||
+    smartdns_health_fail '无法启用 SmartDNS 服务。'
+  systemctl restart smartdns.service ||
+    smartdns_health_fail '无法重启 SmartDNS 服务。'
+  systemctl is-active --quiet smartdns.service ||
+    smartdns_health_fail 'SmartDNS 服务未处于 active 状态。'
 
   for _ in {1..10}; do
     if ss -H -lun 'sport = :53' 2>/dev/null | grep -q '127\.0\.0\.1:53' &&
@@ -2003,11 +2023,16 @@ SMARTDNS_CONFIG
     sleep 1
   done
   ss -H -lun 'sport = :53' 2>/dev/null | grep -q '127\.0\.0\.1:53' ||
-    die 'SmartDNS 未在 127.0.0.1:53/udp 监听。'
+    smartdns_health_fail 'SmartDNS 未在 127.0.0.1:53/udp 监听。'
   ss -H -ltn 'sport = :53' 2>/dev/null | grep -q '127\.0\.0\.1:53' ||
-    die 'SmartDNS 未在 127.0.0.1:53/tcp 监听。'
-  dig +time=2 +tries=1 @127.0.0.1 debian.org A >/dev/null 2>&1 ||
-    die 'SmartDNS 本地解析验证失败，系统 DNS 尚未修改。'
+    smartdns_health_fail 'SmartDNS 未在 127.0.0.1:53/tcp 监听。'
+  if dig_output=$(dig +time=5 +tries=1 +noall +answer @127.0.0.1 debian.org A 2>&1) &&
+    awk 'NF >= 5 && $3 == "IN" && $4 == "A" { found = 1 }
+      END { exit !found }' <<<"$dig_output"; then
+    log 'SmartDNS DoH 解析验证通过：debian.org answer section 包含 IN A 记录。'
+  else
+    smartdns_health_fail 'SmartDNS DoH 解析未返回 IN A 记录，系统 DNS 尚未修改。'
+  fi
 
   SMARTDNS_READY=true
   log "SmartDNS 已安装并验证：$smartdns_version，127.0.0.1:53/udp+tcp。"
