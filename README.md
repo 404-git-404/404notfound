@@ -92,7 +92,9 @@ SmartDNS 模板完整内嵌在 `404notfound.sh`，这是唯一配置来源；仓
 
 上游仅包含 Cloudflare、Google 和 Quad9 的 DoH 地址，使用 IP URL 配合 `-host-name`、`-tls-host-verify` 和 `-http-host`，并通过 `/etc/ssl/certs/ca-certificates.crt` 验证证书；没有明文 UDP/53 fallback，也不包含 DoH3、DoQ、ECS 或 WebUI。安装后使用 `smartdns -v` 取得并记录真实版本，只有命令成功且输出非空才继续。
 
-主脚本会确认 `ca-certificates`、`dnsutils`、系统 CA 文件和内嵌配置可用，再备份并幂等写入 `/etc/smartdns/smartdns.conf`。服务启动后仍验证本地 UDP/TCP 监听，并给予首次 DoH 握手最多 5 秒；`dig @127.0.0.1 debian.org A` 的 answer section 必须至少包含一条 `IN A` 记录，不能只依赖 `dig` 退出码。失败时输出 `smartdns.service` 最近 50 行 journal 并中止，且不会修改 `/etc/resolv.conf`。
+主脚本会确认 `ca-certificates`、`dnsutils` 和系统 CA 文件可用。软件包安装后先停止发行包可能自动启动的 `smartdns.service`，按精确进程名清理残留 SmartDNS 进程及 PID 文件，并等待确认没有残留实例；不会通过 `smartdns -c ... -x` 启动临时守护进程来伪装配置检查。随后检查 53 端口冲突：只允许 `systemd-resolved` 使用 `127.0.0.53:53` 或 `127.0.0.54:53`，其他进程不得占用 SmartDNS 所需的回环、全地址或 IPv6 监听地址。
+
+通过冲突检查后，脚本备份并幂等写入 `/etc/smartdns/smartdns.conf`，重置服务失败状态，再启用并重启正式服务。正式服务启动即完成配置加载验证；之后仍验证 active 状态和本地 UDP/TCP 监听，并给予首次 DoH 握手最多 5 秒。`dig @127.0.0.1 debian.org A` 的 answer section 必须至少包含一条 `IN A` 记录，不能只依赖 `dig` 退出码。启动或健康检查失败时输出 `smartdns.service` 最近 50 行 journal 并中止，且不会修改 `/etc/resolv.conf`。
 
 全部 SmartDNS 检查成功后才切换系统 DNS。最终只保留 `nameserver 127.0.0.1`，随后继续执行现有 `getent` 验证；验证失败时恢复原来的普通文件或软链接。DoH 全部不可用时安装失败，不会静默降级到明文 DNS。
 

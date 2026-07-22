@@ -882,7 +882,7 @@ install_base_packages() {
   local -a required_commands=(
     curl wget git rsync tar unzip xz jq nano gpg openssl socat cron
     crontab ssh sshd ssh-keygen ufw dig ip ss ping nc mtr traceroute
-    tcpdump ps lsof htop chronyd chronyc vnstat python3 flock file
+    tcpdump ps pgrep pkill lsof htop chronyd chronyc vnstat python3 flock file
   )
   local command_name
   for command_name in "${required_commands[@]}"; do
@@ -1942,6 +1942,35 @@ smartdns_health_fail() {
   die "$reason"
 }
 
+stop_and_clean_smartdns() {
+  if ! systemctl stop smartdns.service; then
+    warn '停止 smartdns.service 失败；将继续清理残留 SmartDNS 进程。'
+  fi
+
+  pkill -TERM -x smartdns 2>/dev/null || true
+  for _ in {1..5}; do
+    pgrep -x smartdns >/dev/null 2>&1 || break
+    sleep 1
+  done
+
+  if pgrep -x smartdns >/dev/null 2>&1; then
+    warn 'SmartDNS 残留进程未响应 TERM，改用 KILL 清理。'
+    pkill -KILL -x smartdns 2>/dev/null || true
+  fi
+
+  rm -f -- /run/smartdns.pid /var/run/smartdns.pid
+  for _ in {1..5}; do
+    pgrep -x smartdns >/dev/null 2>&1 || break
+    sleep 1
+  done
+
+  pgrep -x smartdns >/dev/null 2>&1 &&
+    die '清理后仍检测到 SmartDNS 残留进程，拒绝继续配置。'
+  systemctl is-active --quiet smartdns.service &&
+    die '停止后 smartdns.service 仍处于 active 状态，拒绝继续配置。'
+  log 'SmartDNS 服务已停止，残留进程和 PID 文件已清理。'
+}
+
 install_smartdns() {
   CURRENT_STEP='安装并配置 SmartDNS'
   local smartdns_version
@@ -1952,6 +1981,7 @@ install_smartdns() {
   [[ -r /etc/ssl/certs/ca-certificates.crt && -s /etc/ssl/certs/ca-certificates.crt ]] ||
     die '系统 CA 文件不可读或为空：/etc/ssl/certs/ca-certificates.crt。'
   smartdns_version=$(smartdns_version_text) || die 'SmartDNS 版本验证失败。'
+  stop_and_clean_smartdns
 
   local staged_config
   staged_config=$(mktemp "$TMP_DIR/smartdns.conf.XXXXXXXX")
@@ -1984,14 +2014,32 @@ server-https https://9.9.9.9/dns-query -host-name dns.quad9.net -tls-host-verify
 SMARTDNS_CONFIG
 
   local port_53_output
-  port_53_output=$(ss -H -lntup 'sport = :53' 2>/dev/null || true)
-  if grep -Ev 'smartdns|127\.0\.0\.53:53' <<<"$port_53_output" |
-    grep -Eq '(^|[[:space:]])(127\.0\.0\.1|0\.0\.0\.0|\*|\[::\]|\[::1\]):53([[:space:]]|$)'; then
-    die "53 端口已被其他进程占用，拒绝覆盖：$(shorten_line "$port_53_output")"
+  local port_53_conflicts
+  if ! port_53_output=$(ss -H -lntup 'sport = :53' 2>/dev/null); then
+    die '无法检查 53 端口监听状态，拒绝继续配置 SmartDNS。'
   fi
+  port_53_conflicts=$(awk '
+    {
+      endpoint = $5
+      is_systemd_resolved = ($0 ~ /users:\(\("systemd-resolve(d)?"/)
 
-  smartdns -c "$staged_config" -x >/dev/null 2>&1 ||
-    die '内嵌 SmartDNS 配置检查失败。'
+      if (endpoint ~ /^127\.0\.0\.(53|54)(%[^:[:space:]]+)?:53$/) {
+        if (!is_systemd_resolved) {
+          print
+        }
+        next
+      }
+
+      if (endpoint ~ /^127\.0\.0\.1(%[^:[:space:]]+)?:53$/ ||
+          endpoint == "0.0.0.0:53" || endpoint == "*:53" ||
+          endpoint == "[::]:53" || endpoint == "[::1]:53") {
+        print
+      }
+    }
+  ' <<<"$port_53_output")
+  if [[ -n "$port_53_conflicts" ]]; then
+    die "53 端口存在冲突监听，拒绝覆盖：$(shorten_line "$port_53_conflicts")"
+  fi
 
   local service_user
   local service_group
@@ -2008,6 +2056,8 @@ SMARTDNS_CONFIG
   install -d -o "$service_user" -g "$service_group" -m 0750 /var/cache/smartdns
   write_managed_file /etc/smartdns/smartdns.conf 0644 root root <"$staged_config"
 
+  systemctl reset-failed smartdns.service ||
+    smartdns_health_fail '无法重置 SmartDNS 服务失败状态。'
   systemctl enable smartdns.service ||
     smartdns_health_fail '无法启用 SmartDNS 服务。'
   systemctl restart smartdns.service ||
