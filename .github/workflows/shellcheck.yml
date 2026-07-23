@@ -88,6 +88,8 @@ jobs:
           grep -Fq 'systemctl restart smartdns' scripts/update-smartdns.sh
           grep -Fq 'status:[[:space:]]*NOERROR' scripts/update-smartdns.sh
           grep -Fq '允许 ANSWER 为 0' scripts/update-smartdns.sh
+          grep -Fq 'START_TIME="@$(date +%s)"' scripts/update-smartdns.sh
+          ! grep -Fq 'date --iso-8601=seconds' scripts/update-smartdns.sh
           ! grep -Eq 'SCRIPT_DIR|REPO_ROOT|CONFIG_SOURCE|BASH_SOURCE|dirname|pwd -P' scripts/update-smartdns.sh
           ! grep -Fq 'valid_ipv6_answer' scripts/update-smartdns.sh
           ! grep -Eq '(/usr/local|ExecStart|reboot|systemctl (restart|reload) (ssh|sshd|networking|systemd-networkd))' scripts/update-smartdns.sh

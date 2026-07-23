@@ -416,7 +416,7 @@ valid_ipv4_answer() {
 }
 
 start_and_validate_service() {
-  START_TIME=$(date --iso-8601=seconds)
+  START_TIME="@$(date +%s)"
 
   systemctl daemon-reload ||
     fail_with_recovery 'systemctl daemon-reload 失败。'
