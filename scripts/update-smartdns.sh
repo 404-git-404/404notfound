@@ -1,22 +1,18 @@
 #!/usr/bin/env bash
 
-if [[ ${BASH_SOURCE[0]} != "$0" ]]; then
-  printf '[FAIL] 请执行此脚本，不要 source：bash scripts/update-smartdns.sh\n' >&2
+if (return 0 2>/dev/null); then
+  printf '[FAIL] 请执行此脚本，不要 source。\n' >&2
   return 1
 fi
 
 set -Eeuo pipefail
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-readonly SCRIPT_DIR
-REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
-readonly REPO_ROOT
-readonly CONFIG_SOURCE="$REPO_ROOT/smartdns.conf"
 readonly CONFIG_TARGET='/etc/smartdns/smartdns.conf'
 readonly RELEASE_API='https://api.github.com/repos/pymumu/smartdns/releases/latest'
 readonly CA_FILE='/etc/ssl/certs/ca-certificates.crt'
 
 TMP_DIR=''
+STAGED_CONFIG=''
 BACKUP_DIR=''
 START_TIME=''
 JOURNAL_FILE=''
@@ -36,7 +32,7 @@ ENABLED_STATUS=''
 ACTIVE_STATUS=''
 SOCKET_OUTPUT=''
 IPV4_ANSWER=''
-IPV6_ANSWER=''
+AAAA_QUERY_OUTPUT=''
 CONFIG_PREEXISTED=false
 
 log() {
@@ -79,9 +75,6 @@ require_root_and_debian() {
     12 | 13) ;;
     *) die "仅支持 Debian 12/13，当前版本：${os_version:-未知}。" ;;
   esac
-
-  [[ -s "$CONFIG_SOURCE" ]] ||
-    die "仓库根目录配置不存在或为空：$CONFIG_SOURCE。"
 }
 
 install_dependencies() {
@@ -134,8 +127,43 @@ select_architecture() {
 
 create_temporary_directory() {
   TMP_DIR=$(mktemp -d /tmp/update-smartdns.XXXXXXXX)
+  STAGED_CONFIG="$TMP_DIR/smartdns.conf"
   JOURNAL_FILE="$TMP_DIR/smartdns-startup.log"
   DEB_PATH="$TMP_DIR/smartdns.deb"
+}
+
+write_embedded_configuration() {
+  cat >"$STAGED_CONFIG" <<'SMARTDNS_CONFIG'
+bind 127.0.0.1:53
+bind-tcp 127.0.0.1:53
+
+cache-persist yes
+cache-file /var/cache/smartdns/smartdns.cache
+cache-checkpoint-time 86400
+serve-expired yes
+serve-expired-ttl 259200
+serve-expired-reply-ttl 3
+serve-expired-prefetch-time 21600
+prefetch-domain yes
+
+speed-check-mode tcp:443,ping
+response-mode first-ping
+dualstack-ip-selection yes
+dualstack-ip-selection-threshold 10
+
+log-level warn
+log-console no
+log-syslog yes
+audit-enable no
+
+ca-file /etc/ssl/certs/ca-certificates.crt
+
+server-https https://cloudflare-dns.com/dns-query -host-ip 1.1.1.1
+server-https https://dns.google/dns-query -host-ip 8.8.8.8
+server-https https://dns10.quad9.net/dns-query -host-ip 9.9.9.10 -fallback
+SMARTDNS_CONFIG
+
+  [[ -s "$STAGED_CONFIG" ]] || die '生成内嵌 SmartDNS 配置失败。'
 }
 
 fetch_latest_release() {
@@ -341,11 +369,11 @@ deploy_configuration() {
 
   install -d -m 0755 /etc/smartdns /var/cache/smartdns
   if ! rm -f -- "$CONFIG_TARGET" ||
-    ! install -o root -g root -m 0644 "$CONFIG_SOURCE" "$CONFIG_TARGET"; then
+    ! install -o root -g root -m 0644 "$STAGED_CONFIG" "$CONFIG_TARGET"; then
     fail_with_recovery '部署 /etc/smartdns/smartdns.conf 失败。'
   fi
-  cmp -s "$CONFIG_SOURCE" "$CONFIG_TARGET" ||
-    fail_with_recovery '部署后的 SmartDNS 配置与仓库模板不一致。'
+  cmp -s "$STAGED_CONFIG" "$CONFIG_TARGET" ||
+    fail_with_recovery '部署后的 SmartDNS 配置与内嵌模板不一致。'
 
   if ! etc_mode=$(stat -c '%a' /etc/smartdns) ||
     ! cache_mode=$(stat -c '%a' /var/cache/smartdns) ||
@@ -385,13 +413,6 @@ valid_ipv4_answer() {
     }
     END { exit !found }
   ' <<<"$IPV4_ANSWER"
-}
-
-valid_ipv6_answer() {
-  awk '
-    /^[0-9A-Fa-f:]+$/ && index($0, ":") > 0 { found = 1 }
-    END { exit !found }
-  ' <<<"$IPV6_ANSWER"
 }
 
 start_and_validate_service() {
@@ -440,9 +461,11 @@ start_and_validate_service() {
     ! valid_ipv4_answer; then
     fail_with_recovery "SmartDNS IPv4 查询失败：$(shorten_line "$IPV4_ANSWER")"
   fi
-  if ! IPV6_ANSWER=$(dig @127.0.0.1 cloudflare.com AAAA +short +time=5 +tries=1 2>&1) ||
-    ! valid_ipv6_answer; then
-    fail_with_recovery "SmartDNS IPv6 查询失败：$(shorten_line "$IPV6_ANSWER")"
+  if ! AAAA_QUERY_OUTPUT=$(dig @127.0.0.1 cloudflare.com AAAA +time=5 +tries=1 2>&1); then
+    fail_with_recovery "SmartDNS AAAA 查询执行失败：$(shorten_line "$AAAA_QUERY_OUTPUT")"
+  fi
+  if ! grep -Eq 'status:[[:space:]]*NOERROR([,[:space:]]|$)' <<<"$AAAA_QUERY_OUTPUT"; then
+    fail_with_recovery "SmartDNS AAAA 查询状态不是 NOERROR：$(shorten_line "$AAAA_QUERY_OUTPUT")"
   fi
 
   log "systemctl is-enabled smartdns：$ENABLED_STATUS"
@@ -450,7 +473,7 @@ start_and_validate_service() {
   log '本次启动日志未发现 unsupported config、启动或配置解析错误。'
   log '127.0.0.1:53 的 TCP 和 UDP 监听验证通过。'
   log "IPv4 查询结果：$(shorten_line "$IPV4_ANSWER")"
-  log "IPv6 查询结果：$(shorten_line "$IPV6_ANSWER")"
+  log 'AAAA 查询状态：NOERROR（允许 ANSWER 为 0）。'
 }
 
 print_summary() {
@@ -465,7 +488,7 @@ print_summary() {
   printf 'TCP 53：正常\n'
   printf 'UDP 53：正常\n'
   printf 'IPv4 查询：正常\n'
-  printf 'IPv6 查询：正常\n'
+  printf 'AAAA 查询：NOERROR（允许空答案）\n'
   printf '旧配置备份路径：%s\n' "$BACKUP_DIR"
 }
 
@@ -475,6 +498,7 @@ main() {
   verify_required_commands
   select_architecture
   create_temporary_directory
+  write_embedded_configuration
   fetch_latest_release
   download_and_verify_package
   create_backup

@@ -13,6 +13,11 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
+
+      - name: Check committed diff
+        run: git diff --check HEAD^ HEAD
 
       - name: Check Bash syntax
         run: |
@@ -41,6 +46,13 @@ jobs:
           ' 404notfound.sh > /tmp/smartdns.conf
           test -s /tmp/smartdns.conf
           cmp -s smartdns.conf /tmp/smartdns.conf
+          awk '
+            index($0, "<<") && index($0, "SMARTDNS_CONFIG") { capture = 1; next }
+            capture && $0 == "SMARTDNS_CONFIG" { exit }
+            capture { print }
+          ' scripts/update-smartdns.sh > /tmp/update-smartdns.conf
+          test -s /tmp/update-smartdns.conf
+          cmp -s smartdns.conf /tmp/update-smartdns.conf
           ! grep -Eq '^[[:space:]]*#' smartdns.conf
           ! grep -Eqi 'default-group|web.*(user|password)|(^|[[:space:]-])acl([[:space:]-]|$)|^[[:space:]]*(user|password)[[:space:]]' smartdns.conf
           ! grep -Eq '^[[:space:]]*server(-tcp)?[[:space:]]' smartdns.conf
@@ -74,6 +86,10 @@ jobs:
           grep -Fq 'systemctl daemon-reload' scripts/update-smartdns.sh
           grep -Fq 'systemctl enable smartdns' scripts/update-smartdns.sh
           grep -Fq 'systemctl restart smartdns' scripts/update-smartdns.sh
+          grep -Fq 'status:[[:space:]]*NOERROR' scripts/update-smartdns.sh
+          grep -Fq '允许 ANSWER 为 0' scripts/update-smartdns.sh
+          ! grep -Eq 'SCRIPT_DIR|REPO_ROOT|CONFIG_SOURCE|BASH_SOURCE|dirname|pwd -P' scripts/update-smartdns.sh
+          ! grep -Fq 'valid_ipv6_answer' scripts/update-smartdns.sh
           ! grep -Eq '(/usr/local|ExecStart|reboot|systemctl (restart|reload) (ssh|sshd|networking|systemd-networkd))' scripts/update-smartdns.sh
 
       - name: Check installer regressions
