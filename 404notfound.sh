@@ -1986,11 +1986,9 @@ install_smartdns() {
   local staged_config
   staged_config=$(mktemp "$TMP_DIR/smartdns.conf.XXXXXXXX")
   cat >"$staged_config" <<'SMARTDNS_CONFIG'
-# Listen only on the local loopback interface, over both UDP and TCP.
 bind 127.0.0.1:53
 bind-tcp 127.0.0.1:53
 
-# Persistent cache and stale-answer handling.
 cache-persist yes
 cache-file /var/cache/smartdns/smartdns.cache
 cache-checkpoint-time 86400
@@ -2000,17 +1998,21 @@ serve-expired-reply-ttl 3
 serve-expired-prefetch-time 21600
 prefetch-domain yes
 
-# Prefer the first upstream that passes the configured speed checks.
 speed-check-mode tcp:443,ping
 response-mode first-ping
+dualstack-ip-selection yes
+dualstack-ip-selection-threshold 10
 
-# Validate DoH certificates with Debian's system CA bundle.
+log-level warn
+log-console no
+log-syslog yes
+audit-enable no
+
 ca-file /etc/ssl/certs/ca-certificates.crt
 
-# DoH-only upstreams. There is intentionally no plaintext UDP fallback.
-server-https https://1.1.1.1/dns-query -host-name cloudflare-dns.com -tls-host-verify cloudflare-dns.com -http-host cloudflare-dns.com
-server-https https://8.8.8.8/dns-query -host-name dns.google -tls-host-verify dns.google -http-host dns.google
-server-https https://9.9.9.9/dns-query -host-name dns.quad9.net -tls-host-verify dns.quad9.net -http-host dns.quad9.net
+server-https https://cloudflare-dns.com/dns-query -host-ip 1.1.1.1
+server-https https://dns.google/dns-query -host-ip 8.8.8.8
+server-https https://dns10.quad9.net/dns-query -host-ip 9.9.9.10 -fallback
 SMARTDNS_CONFIG
 
   local port_53_output
