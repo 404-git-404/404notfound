@@ -108,7 +108,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/404-git-404/404notfound/main
 
 更新器直接将内嵌配置部署到 `/etc/smartdns/smartdns.conf`，不读取脚本旁边或当前目录中的任何配置或辅助文件。它通过 `pymumu/smartdns` 的 GitHub Releases latest API 动态选择官方 Debian 软件包，支持 `amd64`、`arm64` 和 `armhf`，分别匹配 `x86_64-debian-all.deb`、`aarch64-debian-all.deb` 和 `arm-debian-all.deb`；不会使用 tar、源码编译或 `/usr/local` 下的第二套二进制。
 
-升级前会创建 `/root/smartdns-backup-YYYYMMDD-HHMMSS`，保留原配置和升级前版本记录。安装使用 `--force-confold`，随后将模板部署到官方默认路径 `/etc/smartdns/smartdns.conf`，设置开机启动并重启正式服务。更新器验证 Release 资产、Debian 包架构与版本、二进制路径、服务状态、本次启动日志、`127.0.0.1:53` TCP/UDP 监听以及 `cloudflare.com` 的 A/AAAA 查询。A 查询必须返回有效 IPv4；AAAA 查询只要求执行成功且状态为 `NOERROR`，允许双栈优选导致 `ANSWER: 0`。验证失败时只从备份恢复配置并重新启动服务，不自动降级软件包。
+升级前会创建 `/root/smartdns-backup-YYYYMMDD-HHMMSS`，保留原配置和升级前版本记录。安装使用 `--force-confold`，随后将模板部署到官方默认路径 `/etc/smartdns/smartdns.conf`，设置开机启动并重启正式服务。更新器验证 Release 资产、Debian 包架构与版本、二进制路径、服务状态、本次启动日志、`127.0.0.1:53` TCP/UDP 监听以及 `cloudflare.com` 的 A/AAAA 查询。A 查询必须返回有效 IPv4；AAAA 查询只要求执行成功且状态为 `NOERROR`，允许双栈优选导致 `ANSWER: 0`。
+
+SmartDNS 本体验证全部成功后，更新器只读检查 `/etc/resolv.conf`：忽略空行、注释和非 `nameserver` 配置，要求有效 nameserver 恰好只有 `127.0.0.1`，再通过 `getent ahostsv4 cloudflare.com` 验证 Debian 默认解析链路至少返回一个有效 IPv4。更新器不会备份、覆盖或修改 `/etc/resolv.conf`，不会调用 `resolvectl` 或修改 `systemd-resolved`。系统 DNS 检查失败时以非零状态退出，但不会回滚已经成功更新的 SmartDNS 软件包或配置；此前 SmartDNS 本体检查失败时仍只从备份恢复配置，不自动降级软件包。
 
 ## Cloudflare 8443 更新工具
 
