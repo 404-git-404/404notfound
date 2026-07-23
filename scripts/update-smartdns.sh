@@ -33,6 +33,7 @@ ACTIVE_STATUS=''
 SOCKET_OUTPUT=''
 IPV4_ANSWER=''
 AAAA_QUERY_OUTPUT=''
+SYSTEM_LOOKUP_OUTPUT=''
 CONFIG_PREEXISTED=false
 
 log() {
@@ -104,7 +105,7 @@ install_dependencies() {
 verify_required_commands() {
   local command_name
   local -a required_commands=(
-    apt-get awk cat cmp cp curl date dig dpkg dpkg-deb dpkg-query grep
+    apt-get awk cat cmp cp curl date dig dpkg dpkg-deb dpkg-query getent grep
     install journalctl jq mktemp readlink rm sleep ss stat systemctl tr
   )
 
@@ -415,6 +416,72 @@ valid_ipv4_answer() {
   ' <<<"$IPV4_ANSWER"
 }
 
+valid_system_ipv4_answer() {
+  awk '
+    {
+      if (split($1, octets, /\./) != 4) {
+        next
+      }
+      valid = 1
+      for (i = 1; i <= 4; i++) {
+        if (octets[i] !~ /^[0-9]+$/ || octets[i] < 0 || octets[i] > 255) {
+          valid = 0
+        }
+      }
+      if (valid) {
+        found = 1
+      }
+    }
+    END { exit !found }
+  ' <<<"$SYSTEM_LOOKUP_OUTPUT"
+}
+
+report_system_dns_mismatch() {
+  local nameserver_text=$1
+
+  printf '[FAIL] SmartDNS 已更新并正常运行，但 Debian 系统 DNS 未指向 127.0.0.1。\n' >&2
+  printf '[INFO] 当前有效 nameserver：%s\n' "$nameserver_text" >&2
+  printf '[INFO] 请检查 /etc/resolv.conf；脚本不会自动修改系统 DNS。\n' >&2
+  exit 1
+}
+
+check_debian_system_dns() {
+  local index
+  local nameserver_text='（无）'
+  local -a nameservers=()
+
+  if [[ ! -e /etc/resolv.conf || ! -r /etc/resolv.conf ]]; then
+    report_system_dns_mismatch '（/etc/resolv.conf 不存在或不可读）'
+  fi
+
+  mapfile -t nameservers < <(
+    awk '
+      /^[[:space:]]*($|[;#])/ { next }
+      $1 == "nameserver" && NF >= 2 && $2 !~ /^[;#]/ { print $2 }
+    ' /etc/resolv.conf
+  )
+
+  if ((${#nameservers[@]} > 0)); then
+    nameserver_text=${nameservers[0]}
+    for ((index = 1; index < ${#nameservers[@]}; index++)); do
+      nameserver_text+=", ${nameservers[index]}"
+    done
+  fi
+
+  if ((${#nameservers[@]} != 1)) || [[ "${nameservers[0]:-}" != '127.0.0.1' ]]; then
+    report_system_dns_mismatch "$nameserver_text"
+  fi
+
+  if ! SYSTEM_LOOKUP_OUTPUT=$(getent ahostsv4 cloudflare.com 2>&1) ||
+    ! valid_system_ipv4_answer; then
+    printf '[FAIL] /etc/resolv.conf 已指向 127.0.0.1，但 Debian 系统默认解析失败。\n' >&2
+    exit 1
+  fi
+
+  log 'Debian 系统 DNS 验证通过：仅 127.0.0.1。'
+  log 'Debian 系统默认解析验证通过。'
+}
+
 start_and_validate_service() {
   START_TIME="@$(date +%s)"
 
@@ -489,6 +556,8 @@ print_summary() {
   printf 'UDP 53：正常\n'
   printf 'IPv4 查询：正常\n'
   printf 'AAAA 查询：NOERROR（允许空答案）\n'
+  printf '系统 DNS：仅 127.0.0.1\n'
+  printf '系统解析：正常\n'
   printf '旧配置备份路径：%s\n' "$BACKUP_DIR"
 }
 
@@ -506,6 +575,7 @@ main() {
   verify_installed_package
   deploy_configuration
   start_and_validate_service
+  check_debian_system_dns
   print_summary
 }
 
